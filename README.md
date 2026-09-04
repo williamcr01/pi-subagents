@@ -76,11 +76,12 @@ spawn_agent({
 })
 ```
 
-Optional fields are `name`, `cwd`, `model`, `thinking`, and an exact `tools` allowlist. Model selection is resolved as:
+Optional fields are `name`, `agent`, `cwd`, `model`, `thinking`, and an exact `tools` allowlist. Model selection is resolved as:
 
 1. Per-spawn `model`
-2. `defaultModel` in configuration
-3. The creating agent's active model
+2. `model` from the named [agent definition](#agent-definitions)
+3. `defaultModel` in configuration
+4. The creating agent's active model
 
 Thinking level follows the same precedence and is clamped to the selected child model.
 
@@ -131,6 +132,32 @@ All fields are optional. Defaults are `maxDepth: 2` and `maxConcurrency: 4`.
 - `maxConcurrency` — number of children allowed to run at once. Use `-1` for unlimited or a positive integer for a limit; extra children queue automatically.
 
 The `--subagent-depth N` Pi flag overrides configured depth for the tree. An inherited depth limit can never be raised by a descendant.
+
+## Agent definitions
+
+Reusable subagent types are Markdown files with YAML frontmatter, read from `~/.pi/agent/agents/` and, for a trusted project, `.pi/agents/`. A project definition overrides a global one with the same name.
+
+`~/.pi/agent/agents/reviewer.md`:
+
+```markdown
+---
+name: reviewer
+description: Reviews a diff and reports risks
+model: anthropic/claude-sonnet-4-5
+thinking: high
+tools: read, grep
+---
+
+Review the given change. Report correctness risks first, then style. Never edit files.
+```
+
+All fields are optional. `name` defaults to the filename without `.md` and must match `^[a-z][a-z0-9_-]{0,63}$`; files that fail to parse or resolve to an invalid name are ignored. `tools` accepts a YAML list or a comma-separated string, and `cwd` is resolved like the `spawn_agent` parameter. Everything after the frontmatter becomes extra system prompt for the child.
+
+```text
+spawn_agent({ agent: "reviewer", task: "Review the auth middleware rewrite" })
+```
+
+Per-spawn parameters override the definition, which overrides configured and inherited defaults. Definitions are re-read on every spawn, so a new file works without restarting Pi.
 
 ## Footer controls
 

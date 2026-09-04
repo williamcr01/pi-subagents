@@ -360,7 +360,11 @@ export class SubagentPanel implements Component, Focusable {
 			this.theme.fg("dim", activity),
 			...(isTerminal(record) ? [this.theme.fg("dim", elapsed(record))] : []),
 		].filter((segment): segment is string => Boolean(segment));
-		return `${icon} ${record.name}  ${segments.join(sep)}`;
+		const name =
+			record.agent && record.agent !== record.name
+				? `${record.name} ${this.theme.fg("dim", `(${record.agent})`)}`
+				: record.name;
+		return `${icon} ${name}  ${segments.join(sep)}`;
 	}
 
 	private renderTree(width: number): string[] {

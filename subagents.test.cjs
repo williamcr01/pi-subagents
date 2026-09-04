@@ -38,6 +38,7 @@ function check(name, cond, extra) {
 }
 
 (async () => {
+	const agents = await jiti.import(path.join(HERE, "agents.ts"));
 	const config = await jiti.import(path.join(HERE, "config.ts"));
 	const registry = await jiti.import(path.join(HERE, "registry.ts"));
 	const events = await jiti.import(path.join(HERE, "events.ts"));
@@ -77,6 +78,46 @@ function check(name, cond, extra) {
 		try { config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: false, env: {} }); } catch { threw = true; }
 		check(`invalid ${label} throws`, threw);
 	}
+
+	// --- agent definitions ---
+	const defsDir = path.join(sandbox, "agent-defs");
+	const globalAgents = path.join(defsDir, "agents");
+	fs.mkdirSync(globalAgents, { recursive: true });
+	fs.writeFileSync(path.join(globalAgents, "reviewer.md"), "---\nname: reviewer\ndescription: Reviews code\nmodel: p/global\nthinking: high\ntools:\n  - read\n  - grep\n---\nReview carefully.\n");
+	fs.writeFileSync(path.join(globalAgents, "from-filename.md"), "Body only.\n");
+	fs.writeFileSync(path.join(globalAgents, "comma-tools.md"), "---\ntools: read, grep, bash\n---\n");
+	fs.writeFileSync(path.join(globalAgents, "Bad Name.md"), "---\ndescription: invalid name\n---\n");
+	fs.writeFileSync(path.join(globalAgents, "broken.md"), "---\nname: [unclosed\n---\nbody\n");
+	const globalDefs = agents.loadAgentDefinitions({ agentDir: defsDir, cwd: sandbox, projectTrusted: false });
+	check("loads global definitions", globalDefs.get("reviewer")?.model === "p/global", JSON.stringify([...globalDefs.keys()]));
+	check("name falls back to the filename", globalDefs.get("from-filename")?.prompt === "Body only.", JSON.stringify(globalDefs.get("from-filename")));
+	check("frontmatter tools as a list", JSON.stringify(globalDefs.get("reviewer")?.tools) === JSON.stringify(["read", "grep"]), JSON.stringify(globalDefs.get("reviewer")?.tools));
+	check("frontmatter tools as a comma string", JSON.stringify(globalDefs.get("comma-tools")?.tools) === JSON.stringify(["read", "grep", "bash"]), JSON.stringify(globalDefs.get("comma-tools")?.tools));
+	check("invalid agent name skipped", !globalDefs.has("Bad Name"), JSON.stringify([...globalDefs.keys()]));
+	check("unparseable definition skipped", !globalDefs.has("broken"), JSON.stringify([...globalDefs.keys()]));
+
+	const projectAgents = path.join(sandbox, ".pi", "agents");
+	fs.mkdirSync(projectAgents, { recursive: true });
+	fs.writeFileSync(path.join(projectAgents, "reviewer.md"), "---\nname: reviewer\nmodel: p/project\n---\nProject review.\n");
+	const trustedDefs = agents.loadAgentDefinitions({ agentDir: defsDir, cwd: sandbox, projectTrusted: true });
+	check("project definition overrides global", trustedDefs.get("reviewer")?.model === "p/project", trustedDefs.get("reviewer")?.model);
+	check("untrusted project definitions ignored", agents.loadAgentDefinitions({ agentDir: defsDir, cwd: sandbox, projectTrusted: false }).get("reviewer")?.model === "p/global");
+
+	const merged = agents.resolveSpawnInput({ task: "t", agent: "reviewer", model: "p/explicit" }, globalDefs);
+	check("explicit parameter beats the definition", merged.model === "p/explicit", merged.model);
+	check("definition fills unset parameters", merged.thinking === "high" && merged.name === "reviewer" && JSON.stringify(merged.tools) === JSON.stringify(["read", "grep"]), JSON.stringify(merged));
+	check("definition body becomes the system prompt", merged.systemPrompt === "Review carefully.", merged.systemPrompt);
+	check("spawn without an agent is untouched", agents.resolveSpawnInput({ task: "t", name: "n" }, globalDefs).systemPrompt === undefined);
+	let unknownAgentError = "";
+	try {
+		agents.resolveSpawnInput({ task: "t", agent: "nope" }, globalDefs);
+	} catch (error) {
+		unknownAgentError = String(error);
+	}
+	check("unknown agent lists the available names", unknownAgentError.includes("Unknown agent") && unknownAgentError.includes("reviewer") && unknownAgentError.includes("comma-tools"), unknownAgentError);
+	check("described agents carry their description", agents.describeAgents(globalDefs, { agentDir: defsDir, cwd: sandbox }).includes("reviewer — Reviews code"));
+	const emptyDescription = agents.describeAgents(new Map(), { agentDir: defsDir, cwd: sandbox });
+	check("empty listing names both directories", emptyDescription.includes(globalAgents) && emptyDescription.includes(projectAgents), emptyDescription);
 
 	// --- registry ---
 	const agentDir2 = path.join(sandbox, "agent2");
@@ -251,7 +292,7 @@ function check(name, cond, extra) {
 	panel.dispose();
 
 	registry.saveRecord(agentDir2, mk("alpha", "root2", { status: "running_tool", currentTool: "bash npm test", latestText: "testing…", model: "prov/model-x" }));
-	registry.saveRecord(agentDir2, mk("beta", "root2"));
+	registry.saveRecord(agentDir2, mk("beta", "root2", { agent: "reviewer" }));
 	panel = new SubagentPanel(tui, theme, agentDir2, "root2");
 	panel.setMainModel("p/m");
 	const summary = panel.render(100);
@@ -261,6 +302,7 @@ function check(name, cond, extra) {
 	tui.setFocus(panel);
 	const list = panel.render(100);
 	check("list shows children", list.some((l) => l.includes("alpha")) && list.some((l) => l.includes("beta")), list.join(" | "));
+	check("row labels the agent definition", list.some((l) => l.includes("beta (reviewer)")), list.join(" | "));
 	panel.handleInput("");
 	check("esc returns focus", focusedTarget.value === "null", focusedTarget.value);
 	const strip = (l) => l.replace(/\[[0-9;]*m/g, "");
@@ -449,6 +491,22 @@ function check(name, cond, extra) {
 	navPanel.handleInput("\x1b[D");
 	check("left closes panel", focusedTarget.value === "null", focusedTarget.value);
 	navPanel.dispose();
+
+	// --- agent definition body reaches the child system prompt ---
+	const probe = path.join(sandbox, "argv-probe.cjs");
+	const argvOut = path.join(sandbox, "argv.json");
+	fs.writeFileSync(probe, `require("node:fs").writeFileSync(${JSON.stringify(argvOut)}, JSON.stringify(process.argv.slice(2)));\n`);
+	process.env.PI_SUBAGENT_COMMAND = probe;
+	const promptRec = await spawn.startSubagent({ task: "prompted", name: "prompted", agent: "reviewer", systemPrompt: "Review carefully." }, baseCtx());
+	for (let i = 0; i < 100; i++) {
+		const row = registry.readRecords(spawnAgentDir).find((r) => r.runId === promptRec.runId);
+		if (row && ["completed", "failed", "cancelled"].includes(row.status)) break;
+		await new Promise((r) => setTimeout(r, 25));
+	}
+	const probeArgv = fs.existsSync(argvOut) ? JSON.parse(fs.readFileSync(argvOut, "utf8")) : [];
+	const appendedPrompt = probeArgv[probeArgv.indexOf("--append-system-prompt") + 1] ?? "";
+	check("agent body appended after the built-in system prompt", appendedPrompt.startsWith("You are subagent") && appendedPrompt.endsWith("Review carefully."), appendedPrompt);
+	check("record keeps the agent name", registry.readRecords(spawnAgentDir).find((r) => r.runId === promptRec.runId)?.agent === "reviewer");
 
 	delete process.env.PI_SUBAGENT_COMMAND;
 

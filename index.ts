@@ -8,6 +8,7 @@ import {
 } from "@earendil-works/pi-coding-agent";
 import { Key, Markdown, matchesKey, Text, type EditorTheme, type TUI } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
+import { AGENT_PARAMETER_DESCRIPTION, describeAgents, loadAgentDefinitions, resolveSpawnInput } from "./agents.ts";
 import { currentDepth, loadSettings } from "./config.ts";
 import { consumeSubagentMessages, queueSubagentMessage } from "./control.ts";
 import { SubagentPanel } from "./panel.ts";
@@ -24,14 +25,16 @@ interface RuntimeState {
 	projectTrusted: boolean;
 }
 
-const SpawnAgentSchema = Type.Object({
-	task: Type.String({ description: "Focused task to delegate to the subagent" }),
-	name: Type.Optional(Type.String({ description: "Readable subagent name" })),
-	cwd: Type.Optional(Type.String({ description: "Working directory, relative to the current agent unless absolute" })),
-	model: Type.Optional(Type.String({ description: "Exact model selector. Overrides configured and inherited defaults." })),
-	thinking: Type.Optional(Type.String({ description: "Thinking level for this subagent" })),
-	tools: Type.Optional(Type.Array(Type.String(), { description: "Optional exact tool allowlist" })),
-});
+const spawnAgentSchema = (agentDescription: string) =>
+	Type.Object({
+		task: Type.String({ description: "Focused task to delegate to the subagent" }),
+		name: Type.Optional(Type.String({ description: "Readable subagent name" })),
+		agent: Type.Optional(Type.String({ description: agentDescription })),
+		cwd: Type.Optional(Type.String({ description: "Working directory, relative to the current agent unless absolute" })),
+		model: Type.Optional(Type.String({ description: "Exact model selector. Overrides configured and inherited defaults." })),
+		thinking: Type.Optional(Type.String({ description: "Thinking level for this subagent" })),
+		tools: Type.Optional(Type.Array(Type.String(), { description: "Optional exact tool allowlist" })),
+	});
 
 const CheckSchema = Type.Object({
 	wait: Type.Optional(Type.Boolean({ description: "Block until every subagent finishes or the timeout elapses" })),
@@ -156,6 +159,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		}
 
 		if (!runtime) return;
+
+		// Project trust only exists once the session starts, so the tool is
+		// registered again to list the agents this session can actually use.
+		const agentDir = getAgentDir();
+		registerSpawnAgent(
+			describeAgents(loadAgentDefinitions({ agentDir, cwd: ctx.cwd, projectTrusted: runtime.projectTrusted }), {
+				agentDir,
+				cwd: ctx.cwd,
+			}),
+		);
 
 		// Every subagent process consumes its own private inbox. This keeps
 		// steering recursive: the root UI can address grandchildren directly.
@@ -325,95 +338,100 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		},
 	});
 
-	pi.registerTool({
-		name: "spawn_agent",
-		label: "Spawn Agent",
-		description:
-			"Spawn an isolated recursive Pi subagent that runs in the background and returns immediately. Omit model to use subagents.json defaultModel, or inherit the creating agent's active model. The child keeps running while you do other work; collect results with check_subagents (results also arrive automatically when you go idle).",
-		promptSnippet: "Delegate focused independent work to an isolated recursive subagent running in the background",
-		promptGuidelines: [
-			"spawn_agent returns immediately; the child keeps running while you continue other work.",
-			"Call check_subagents with wait:true before your final answer whenever spawned results matter, and use cancel_subagent to stop a runaway child.",
-		],
-		parameters: SpawnAgentSchema,
-		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
-			if (!runtime) throw new Error("Subagent extension settings failed to initialize");
-			const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
-			const record = await startSubagent(
-				{
-					task: params.task,
-					name: params.name,
-					cwd: params.cwd ? resolve(ctx.cwd, params.cwd) : undefined,
-					model: params.model,
-					thinking: params.thinking,
-					tools: params.tools,
-				},
-				{
-					agentDir: getAgentDir(),
-					parentRunId: runtime.runId,
-					rootRunId: runtime.rootRunId,
-					currentDepth: runtime.depth,
-					settings: runtime.settings,
-					parentModel,
-					parentThinking: ctx.thinkingLevel,
-					parentCwd: ctx.cwd,
-					projectTrusted: runtime.projectTrusted,
-					persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc",
-					signal,
-					onRecord: trackChild,
-					onUiRequest: async (child, request) => {
-						const title = `[${child.name}] ${request.title || "Subagent request"}`;
-						const opts = typeof request.timeout === "number" ? { timeout: request.timeout } : undefined;
-						switch (request.method) {
-							case "select": {
-								const value = await ctx.ui.select(title, request.options ?? [], opts);
-								return value === undefined ? { cancelled: true } : { value };
-							}
-							case "confirm":
-								return { confirmed: await ctx.ui.confirm(title, request.message ?? "", opts) };
-							case "input": {
-								const value = await ctx.ui.input(title, request.placeholder, opts);
-								return value === undefined ? { cancelled: true } : { value };
-							}
-							case "editor": {
-								const value = await ctx.ui.editor(title, request.prefill);
-								return value === undefined ? { cancelled: true } : { value };
-							}
-							case "notify":
-								ctx.ui.notify(`[${child.name}] ${request.message ?? ""}`, request.notifyType);
-						}
-					},
-					onSettled: trackChild,
-				},
-			);
-			return {
-				content: [
+	const registerSpawnAgent = (agentDescription: string) => {
+		pi.registerTool({
+			name: "spawn_agent",
+			label: "Spawn Agent",
+			description:
+				"Spawn an isolated recursive Pi subagent that runs in the background and returns immediately. Omit model to use subagents.json defaultModel, or inherit the creating agent's active model. The child keeps running while you do other work; collect results with check_subagents (results also arrive automatically when you go idle).",
+			promptSnippet: "Delegate focused independent work to an isolated recursive subagent running in the background",
+			promptGuidelines: [
+				"spawn_agent returns immediately; the child keeps running while you continue other work.",
+				"Call check_subagents with wait:true before your final answer whenever spawned results matter, and use cancel_subagent to stop a runaway child.",
+			],
+			parameters: spawnAgentSchema(agentDescription),
+			async execute(_toolCallId, params, signal, _onUpdate, ctx) {
+				if (!runtime) throw new Error("Subagent extension settings failed to initialize");
+				const parentModel = ctx.model ? `${ctx.model.provider}/${ctx.model.id}` : undefined;
+				// Re-read definitions so a file added mid-session works without a restart.
+				const input = resolveSpawnInput(
+					params,
+					loadAgentDefinitions({ agentDir: getAgentDir(), cwd: ctx.cwd, projectTrusted: runtime.projectTrusted }),
+				);
+				const record = await startSubagent(
 					{
-						type: "text",
-						text: `Spawned subagent "${record.name}" (run ${shortId(record.runId)}, depth ${record.depth}/${record.maxDepth}, model ${record.model}). It is ${record.status === "queued" ? "queued" : "running in the background"} — continue with other work and call check_subagents (wait:true) to collect its result.`,
+						...input,
+						cwd: input.cwd ? resolve(ctx.cwd, input.cwd) : undefined,
 					},
-				],
-				details: { record },
-			};
-		},
-		renderCall(args, theme) {
-			const name = args.name?.trim() || args.task.replace(/\s+/g, " ").slice(0, 50);
-			const model = args.model ? ` · ${args.model}` : "";
-			return new Text(`${theme.fg("toolTitle", theme.bold("spawn_agent"))} ${theme.fg("accent", name)}${theme.fg("dim", model)}`, 0, 0);
-		},
-		renderResult(result, _options, theme) {
-			const record = result.details?.record;
-			if (!record) {
-				const text = result.content[0];
-				return new Text(text?.type === "text" ? text.text : "", 0, 0);
-			}
-			return new Text(
-				`${theme.fg("accent", "◌")} ${theme.fg("accent", record.name)} ${theme.fg("dim", "· spawned in background")}`,
-				0,
-				0,
-			);
-		},
-	});
+					{
+						agentDir: getAgentDir(),
+						parentRunId: runtime.runId,
+						rootRunId: runtime.rootRunId,
+						currentDepth: runtime.depth,
+						settings: runtime.settings,
+						parentModel,
+						parentThinking: ctx.thinkingLevel,
+						parentCwd: ctx.cwd,
+						projectTrusted: runtime.projectTrusted,
+						persistAfterSettled: ctx.mode === "tui" || ctx.mode === "rpc",
+						signal,
+						onRecord: trackChild,
+						onUiRequest: async (child, request) => {
+							const title = `[${child.name}] ${request.title || "Subagent request"}`;
+							const opts = typeof request.timeout === "number" ? { timeout: request.timeout } : undefined;
+							switch (request.method) {
+								case "select": {
+									const value = await ctx.ui.select(title, request.options ?? [], opts);
+									return value === undefined ? { cancelled: true } : { value };
+								}
+								case "confirm":
+									return { confirmed: await ctx.ui.confirm(title, request.message ?? "", opts) };
+								case "input": {
+									const value = await ctx.ui.input(title, request.placeholder, opts);
+									return value === undefined ? { cancelled: true } : { value };
+								}
+								case "editor": {
+									const value = await ctx.ui.editor(title, request.prefill);
+									return value === undefined ? { cancelled: true } : { value };
+								}
+								case "notify":
+									ctx.ui.notify(`[${child.name}] ${request.message ?? ""}`, request.notifyType);
+							}
+						},
+						onSettled: trackChild,
+					},
+				);
+				return {
+					content: [
+						{
+							type: "text",
+							text: `Spawned subagent "${record.name}" (run ${shortId(record.runId)}, depth ${record.depth}/${record.maxDepth}, model ${record.model}). It is ${record.status === "queued" ? "queued" : "running in the background"} — continue with other work and call check_subagents (wait:true) to collect its result.`,
+						},
+					],
+					details: { record },
+				};
+			},
+			renderCall(args, theme) {
+				const name = args.name?.trim() || args.task.replace(/\s+/g, " ").slice(0, 50);
+				const model = args.model ? ` · ${args.model}` : "";
+				return new Text(`${theme.fg("toolTitle", theme.bold("spawn_agent"))} ${theme.fg("accent", name)}${theme.fg("dim", model)}`, 0, 0);
+			},
+			renderResult(result, _options, theme) {
+				const record = result.details?.record;
+				if (!record) {
+					const text = result.content[0];
+					return new Text(text?.type === "text" ? text.text : "", 0, 0);
+				}
+				return new Text(
+					`${theme.fg("accent", "◌")} ${theme.fg("accent", record.name)} ${theme.fg("dim", "· spawned in background")}`,
+					0,
+					0,
+				);
+			},
+		});
+	};
+
+	registerSpawnAgent(AGENT_PARAMETER_DESCRIPTION);
 
 	pi.registerTool({
 		name: "check_subagents",

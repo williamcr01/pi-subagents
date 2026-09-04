@@ -213,6 +213,7 @@ export async function startSubagent(input: SpawnAgentInput, context: SpawnContex
 		rootRunId: context.rootRunId,
 		sessionId: runId,
 		name: compactName(input),
+		agent: input.agent,
 		task: input.task,
 		cwd,
 		model,
@@ -293,7 +294,8 @@ async function runSubagentProcess(
 		release = await gate.acquire(context.settings.maxConcurrency);
 		if (record.status === "cancelled" || diskCancelled()) return;
 
-		const systemPrompt = `You are subagent "${record.name}" at depth ${record.depth}/${record.maxDepth}. Complete delegated tasks and return concise, self-contained results.`;
+		const intro = `You are subagent "${record.name}" at depth ${record.depth}/${record.maxDepth}. Complete delegated tasks and return concise, self-contained results.`;
+		const systemPrompt = input.systemPrompt ? `${intro}\n\n${input.systemPrompt}` : intro;
 		const args = [
 			"--mode",
 			"rpc",

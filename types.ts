@@ -26,6 +26,8 @@ export interface AgentRecord {
 	sessionFile?: string;
 	pid?: number;
 	name: string;
+	/** Name of the agent definition applied at spawn, when one was used. */
+	agent?: string;
 	task: string;
 	cwd: string;
 	model: string;
@@ -58,10 +60,13 @@ export interface SubagentSettings {
 export interface SpawnAgentInput {
 	task: string;
 	name?: string;
+	agent?: string;
 	cwd?: string;
 	model?: string;
 	thinking?: string;
 	tools?: string[];
+	/** Extra system prompt appended for the child, taken from the agent definition body. */
+	systemPrompt?: string;
 }
 
 export const EMPTY_USAGE: UsageSummary = {
