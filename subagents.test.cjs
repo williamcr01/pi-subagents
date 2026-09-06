@@ -342,6 +342,21 @@ function check(name, cond, extra) {
 		for (let i = 0; i < 100 && automaticSendAttempts < 2; i++) await new Promise((r) => setTimeout(r, 25));
 		check("failed automatic send is retried", automaticSendAttempts >= 2, String(automaticSendAttempts));
 		check("successful automatic retry claims result", registry.readRecords(checkAgentDir).find((r) => r.runId === "retry-child")?.resultsDelivered === true);
+
+		// An asynchronous send failure must behave like a synchronous one: the
+		// result stays pending and the delivery loop retries it.
+		let asyncAutomaticSendAttempts = 0;
+		checkPi.sendMessage = async () => {
+			asyncAutomaticSendAttempts++;
+			if (asyncAutomaticSendAttempts === 1) throw new Error("temporary async send failure");
+		};
+		registry.saveRecord(checkAgentDir, checkRecord("async-retry-child", "thinking"));
+		await checkTools.get("cancel_subagent").execute("cancel-async-retry", { target: "async-retry-child" }, undefined, undefined, {});
+		for (let i = 0; i < 100 && asyncAutomaticSendAttempts < 1; i++) await new Promise((r) => setTimeout(r, 25));
+		check("async failed automatic send leaves result unclaimed", registry.readRecords(checkAgentDir).find((r) => r.runId === "async-retry-child")?.resultsDelivered !== true);
+		for (let i = 0; i < 100 && asyncAutomaticSendAttempts < 2; i++) await new Promise((r) => setTimeout(r, 25));
+		check("async failed automatic send is retried", asyncAutomaticSendAttempts >= 2, String(asyncAutomaticSendAttempts));
+		check("successful async automatic retry claims result", registry.readRecords(checkAgentDir).find((r) => r.runId === "async-retry-child")?.resultsDelivered === true);
 	} finally {
 		checkHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;

@@ -147,7 +147,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				scheduleDelivery(retryDelay);
 			}
 		}, delay);
-		deliveryTimer.unref?.();
+		// Unlike progress/debounce timers, this timer is the only thing that can
+		// deliver a completed result after a print-mode parent becomes idle. Keep it
+		// referenced so the parent cannot exit before the automatic delivery runs.
 	};
 
 	const deliverResults = async () => {
@@ -169,7 +171,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			stillRunning > 0
 				? `Subagent results (${pending.length} finished, ${stillRunning} still running):`
 				: `All ${pending.length} subagent${pending.length === 1 ? "" : "s"} finished:`;
-		pi.sendMessage(
+		// sendMessage is allowed to be asynchronous. Do not claim the records until
+		// its promise resolves; otherwise a rejected delivery can lose the result
+		// permanently (and may become an unhandled rejection).
+		await pi.sendMessage(
 			{
 				customType: "subagent-results",
 				content: `${intro}\n\n${parts.join("\n\n")}`,
