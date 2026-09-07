@@ -6,6 +6,7 @@ import {
 	type ExtensionAPI,
 	type ExtensionUIContext,
 	type KeybindingsManager,
+	type SessionEntry,
 } from "@earendil-works/pi-coding-agent";
 import { Key, Markdown, matchesKey, Text, type EditorComponent } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
@@ -114,6 +115,39 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let stopOwnerConsumer: (() => Promise<void>) | undefined;
 	let sessionAbort = new AbortController();
 	let shuttingDown = false;
+	let agentActive = false;
+	let isIdle: (() => boolean) | undefined;
+	let delivering = false;
+	let deliveryPaused = false;
+	let activeSignal: AbortSignal | undefined;
+	const deliveredResults = new Set<string>();
+	const seenDescendantResults = new Set<string>();
+	const resultKey = (record: AgentRecord) => JSON.stringify([
+		record.runId, record.executionId ?? record.finishedAt ?? record.updatedAt,
+	]);
+	const rememberDelivered = (records: AgentRecord[]) => {
+		for (const record of records) {
+			deliveredResults.add(resultKey(record));
+			try { markRecordResultState(getAgentDir(), record, "resultsDelivered"); } catch {
+				// Keep the report in the returned content even if disk persistence fails.
+				// Session receipts restore this in-memory claim after reload.
+			}
+		}
+	};
+	const restoreReceipts = (entries: readonly SessionEntry[]) => {
+		seenDescendantResults.clear();
+		for (const entry of entries) {
+			const rawDetails = entry.type === "custom_message" && entry.customType === "subagent-results"
+				? entry.details : entry.type === "message" && entry.message.role === "toolResult" ? entry.message.details : undefined;
+			const details = rawDetails as { resultKeys?: unknown; seenDescendantResults?: unknown } | undefined;
+			for (const key of Array.isArray(details?.resultKeys) ? details.resultKeys : []) {
+				if (typeof key === "string") deliveredResults.add(key);
+			}
+			for (const key of Array.isArray(details?.seenDescendantResults) ? details.seenDescendantResults : []) {
+				if (typeof key === "string") seenDescendantResults.add(key);
+			}
+		}
+	};
 	let previousEditorFactory: EditorFactory;
 	let installedEditorFactory: EditorFactory;
 
@@ -155,10 +189,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	};
 
 	const deliverResults = async () => {
-		if (!runtime || shuttingDown) return;
+		// Never put result snapshots in Pi's follow-up queue while work is active.
+		// Tool results drain the inbox during a run; agent_settled wakes it at idle.
+		if (!runtime || shuttingDown || delivering || deliveryPaused || agentActive || isIdle?.() === false) return;
 		const agentDir = getAgentDir();
 		const children = readRecords(agentDir).filter((record) => record.parentRunId === runtime!.runId);
-		const pending = children.filter((record) => isTerminalStatus(record.status) && !record.resultsDelivered);
+		const pending = children.filter((record) => isTerminalStatus(record.status) && !record.resultsDelivered && !deliveredResults.has(resultKey(record)));
 		if (pending.length === 0) return;
 		const stillRunning = children.filter((record) => !isTerminalStatus(record.status)).length;
 		const parts = pending.map((record) => {
@@ -173,26 +209,66 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			stillRunning > 0
 				? `Subagent results (${pending.length} finished, ${stillRunning} still running):`
 				: `All ${pending.length} subagent${pending.length === 1 ? "" : "s"} finished:`;
-		// sendMessage is allowed to be asynchronous. Do not claim the records until
-		// its promise resolves; otherwise a rejected delivery can lose the result
-		// permanently (and may become an unhandled rejection).
-		await pi.sendMessage(
-			{
-				customType: "subagent-results",
-				content: `${intro}\n\n${parts.join("\n\n")}`,
-				display: true,
-				details: {},
-			},
-			{ triggerTurn: true, deliverAs: "followUp" },
-		);
-		for (const record of pending) {
-			try {
-				markRecordResultState(agentDir, record, "resultsDelivered");
-			} catch {
-				// The message was accepted. Do not resend it in a tight loop when claim persistence fails.
-			}
+		// Pi's extension binding returns void, not a model-completion receipt.
+		// At idle it starts the prompt directly instead of queueing a follow-up.
+		// Also honor rejection from hosts that return a promise.
+		delivering = true;
+		try {
+			await pi.sendMessage(
+				{
+					customType: "subagent-results",
+					content: `${intro}\n\n${parts.join("\n\n")}`,
+					display: true,
+					details: { resultKeys: pending.map(resultKey) },
+				},
+				{ triggerTurn: true, deliverAs: "followUp" },
+			);
+			rememberDelivered(pending);
+		} finally {
+			delivering = false;
 		}
 	};
+
+	pi.on("agent_start", (_event, ctx) => {
+		agentActive = true;
+		deliveryPaused = false;
+		activeSignal = ctx.signal;
+	});
+	pi.on("message_end", (event) => {
+		if (event.message.role === "assistant" && event.message.stopReason === "aborted") deliveryPaused = true;
+	});
+	pi.on("agent_settled", () => {
+		agentActive = false;
+		if (activeSignal?.aborted) deliveryPaused = true;
+		if (!deliveryPaused) scheduleDelivery(0);
+	});
+	pi.on("session_tree", (_event, ctx) => restoreReceipts(ctx.sessionManager.getBranch()));
+
+	// Attach fresh results to a completed tool, rather than queueing a separate
+	// prompt. Pi persists this content and includes it in the next model call.
+	// This does not steer the agent or skip any sibling tool calls.
+	pi.on("tool_result", (event, ctx) => {
+		if (ctx.signal?.aborted) { deliveryPaused = true; return; }
+		if (!runtime || shuttingDown || delivering || deliveryPaused) return;
+		// Custom tools may use scalar/array details. Leave their result shape alone.
+		if (event.details !== undefined && (!event.details || typeof event.details !== "object" || Array.isArray(event.details))) return;
+		const details = event.details as Record<string, unknown> | undefined;
+		const previousKeys = Array.isArray(details?.resultKeys) ? details.resultKeys : [];
+		const agentDir = getAgentDir();
+		const pending = readRecords(agentDir).filter(
+			(record) => record.parentRunId === runtime!.runId && isTerminalStatus(record.status) && !record.resultsDelivered && !deliveredResults.has(resultKey(record)),
+		);
+		if (pending.length === 0) return;
+		const text = pending.map((record) => {
+			const body = record.status === "completed" ? record.latestText || "(no output)" : record.error || record.status;
+			return `### ${record.name} — ${record.status}\n\n${cap(body, RESULT_OUTPUT_CAP)}`;
+		}).join("\n\n");
+		rememberDelivered(pending);
+		return {
+			content: [...event.content, { type: "text" as const, text: `Subagent results:\n\n${text}` }],
+			details: { ...details, resultKeys: [...previousKeys, ...pending.map(resultKey)] },
+		};
+	});
 
 	pi.registerFlag("subagent-depth", {
 		description: "Maximum recursive subagent depth (any non-negative integer)",
@@ -201,6 +277,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	pi.on("session_start", (_event, ctx) => {
 		shuttingDown = false;
+		agentActive = false;
+		isIdle = () => ctx.isIdle?.() ?? !agentActive;
+		deliveryPaused = false;
+		deliveredResults.clear();
+		restoreReceipts(ctx.sessionManager.getBranch?.() ?? []);
 		const runId = process.env.PI_SUBAGENT_RUN_ID || ctx.sessionManager.getSessionId();
 		const rootRunId = process.env.PI_SUBAGENT_ROOT_ID || runId;
 		try {
@@ -222,6 +303,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		}
 
 		if (!runtime) return;
+		scheduleDelivery();
 
 		// Recursive messages go to the target's owner, never directly to its
 		// input loop: only the owner can reserve/release its concurrency slot.
@@ -382,7 +464,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "spawn_agent",
 		label: "Spawn Agent",
 		description:
-			"Spawn an isolated recursive Pi subagent that runs in the background and returns immediately. Omit model to use subagents.json defaultModel, or inherit the creating agent's active model. Omit tools to inherit the creating session's active tools; an explicit list may only remove tools. The child keeps running while you do other work; collect results with check_subagents (results also arrive automatically when you go idle).",
+			"Spawn an isolated recursive Pi subagent that runs in the background and returns immediately. Omit model to use subagents.json defaultModel, or inherit the creating agent's active model. Omit tools to inherit the creating session's active tools; an explicit list may only remove tools. The child keeps running while you do other work; collect results with check_subagents. Finished results also arrive with the next completed tool result, or automatically when you go idle.",
 		promptSnippet: "Delegate focused independent work to an isolated recursive subagent running in the background",
 		promptGuidelines: [
 			"spawn_agent returns immediately; the child keeps running while you continue other work.",
@@ -491,24 +573,28 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			// This session owns delivery only for its direct children. Descendant
 			// results remain visible, but their direct parent must claim them.
 			const newlyFinished = rows.filter(
-				(record) => record.parentRunId === runtime!.runId && isTerminalStatus(record.status) && !record.resultsDelivered,
+				(record) => record.parentRunId === runtime!.runId && isTerminalStatus(record.status) && !record.resultsDelivered && !deliveredResults.has(resultKey(record)),
 			);
-			for (const record of newlyFinished) {
-				markRecordResultState(agentDir, record, "resultsDelivered");
-			}
+			rememberDelivered(newlyFinished);
 			if (rows.length === 0) {
 				return { content: [{ type: "text", text: "No subagents have been spawned by this session." }], details: { records: [] } };
 			}
 			const running = rows.filter((record) => !isTerminalStatus(record.status));
 			const newlyFinishedIds = new Set(newlyFinished.map((record) => record.runId));
+			const observedDescendants: string[] = [];
 			const sections = rows
 				.filter(
 					(record) =>
 						!isTerminalStatus(record.status) ||
 						newlyFinishedIds.has(record.runId) ||
-						(record.parentRunId !== runtime!.runId && !record.resultsDelivered),
+						(record.parentRunId !== runtime!.runId && !record.resultsDelivered && !seenDescendantResults.has(resultKey(record))),
 				)
 				.map((record) => {
+					if (record.parentRunId !== runtime!.runId && isTerminalStatus(record.status)) {
+						const key = resultKey(record);
+						seenDescendantResults.add(key);
+						observedDescendants.push(key);
+					}
 					const readOnly = record.parentRunId !== runtime!.runId ? " · read-only descendant" : "";
 					const meta = `${record.model} · depth ${record.depth}/${record.maxDepth} · ${record.cwd}${record.runId ? ` · run ${shortId(record.runId)}` : ""}${readOnly}`;
 					let body: string;
@@ -529,7 +615,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			const sectionText = sections.length > 0 ? sections.join("\n\n") : "No new subagent results since the last check.";
 			return {
 				content: [{ type: "text", text: `${summary}\n\n${sectionText}` }],
-				details: { records: rows },
+				details: { records: rows, resultKeys: newlyFinished.map(resultKey), seenDescendantResults: observedDescendants },
 			};
 		},
 	});
