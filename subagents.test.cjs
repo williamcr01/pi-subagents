@@ -109,6 +109,31 @@ function check(name, cond, extra) {
 	const depths = registry.relativeDepths(all, "root");
 	check("relative depths", depths.get("child1") === 0 && depths.get("grand") === 1, JSON.stringify([...depths]));
 
+	// --- actionable run IDs ---
+	const targetA = mk("12345678-aaaa-4000-8000-000000000001", "root", { name: "review", sessionId: "session-a" });
+	const targetB = mk("87654321-bbbb-4000-8000-000000000002", "root", { name: "review", sessionId: "session-b" });
+	const targets = [targetA, targetB];
+	check("displayed eight-character run ID resolves", registry.resolveAgentRecord(targets, "12345678") === targetA);
+	check("full run ID resolves", registry.resolveAgentRecord(targets, targetB.runId) === targetB);
+	check("exact session ID resolves", registry.resolveAgentRecord(targets, "session-b") === targetB);
+	check("target whitespace is trimmed", registry.resolveAgentRecord(targets, " 12345678 ") === targetA);
+	const named = mk("other-id", "root", { name: "12345678", sessionId: "other-session" });
+	check("exact name takes precedence over run prefix", registry.resolveAgentRecord([...targets, named], "12345678") === named);
+	const collision = mk("12345678-cccc-4000-8000-000000000003", "root");
+	for (const [label, rows, target] of [
+		["duplicate name", targets, "review"],
+		["ambiguous prefix", [...targets, collision], "12345678"],
+	]) {
+		let error;
+		try { registry.resolveAgentRecord(rows, target); } catch (caught) { error = caught; }
+		check(`${label} rejected with actionable full IDs`, error?.message.includes("ambiguous") && error.message.includes(targetA.runId) && error.message.includes(label === "duplicate name" ? targetB.runId : collision.runId), error?.message);
+	}
+	for (const target of ["", "   ", "unknown"]) {
+		let rejected = false;
+		try { registry.resolveAgentRecord(targets, target); } catch { rejected = true; }
+		check(`invalid target ${JSON.stringify(target)} rejected`, rejected);
+	}
+
 	// --- wait ---
 	const waitSleep = (ms) => new Promise((resolveWait) => setTimeout(resolveWait, ms));
 	const waitCase = (name) => path.join(sandbox, `wait-${name}`);
@@ -255,6 +280,13 @@ function check(name, cond, extra) {
 			mode: "rpc",
 			hasUI: false,
 		});
+		const prefixRecord = mk("abcd1234-aaaa-4000-8000-000000000004", "check-parent", { rootRunId: "check-parent", status: "completed" });
+		registry.saveRecord(checkAgentDir, prefixRecord);
+		const prefixCancel = await checkTools.get("cancel_subagent").execute("cancel-prefix", { target: "abcd1234" }, undefined, undefined, {});
+		check("cancel tool accepts displayed run prefix", prefixCancel.details.record.runId === prefixRecord.runId);
+		let prefixSendError;
+		try { await checkTools.get("send_to_subagent").execute("send-prefix", { target: "abcd1234", message: "hello" }); } catch (error) { prefixSendError = error; }
+		check("send tool resolves prefix before checking liveness", prefixSendError?.message.includes("is no longer running"), prefixSendError?.message);
 		const checkTool = checkTools.get("check_subagents");
 		const checkRecord = (runId, status, extra = {}) => mk(runId, "check-parent", { rootRunId: "check-parent", status, ...extra });
 		registry.saveRecord(checkAgentDir, checkRecord("first", "completed", { latestText: "first result" }));

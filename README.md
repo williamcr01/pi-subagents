@@ -57,7 +57,7 @@ Use `check_subagents` to inspect progress or wait for results:
 check_subagents({ wait: true, timeoutMs: 120000 })
 ```
 
-Use `send_to_subagent` to steer a running child or continue a completed one. Use `cancel_subagent` to stop a child. Both accept a run ID, session ID, or exact name.
+Use `send_to_subagent` to steer a running child or continue a completed one. Use `cancel_subagent` to stop a child. Both accept a full run ID, a unique run-ID prefix (including the eight characters shown in tool output), a session ID, or an exact name. Exact matches take precedence over prefixes; ambiguous targets are rejected with full run IDs for disambiguation.
 
 ## Isolation model
 

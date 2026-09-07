@@ -21,7 +21,7 @@ import {
 	startSubagent,
 	terminateOwnedSubagents,
 } from "./spawn-agent.ts";
-import { descendantsOf } from "./registry.ts";
+import { descendantsOf, resolveAgentRecord } from "./registry.ts";
 import type { AgentRecord, SubagentSettings } from "./types.ts";
 
 interface RuntimeState {
@@ -86,11 +86,11 @@ const CheckSchema = Type.Object({
 });
 
 const CancelSchema = Type.Object({
-	target: Type.String({ description: "Subagent run id, session id, or exact name" }),
+	target: Type.String({ description: "Subagent run id (or unique prefix), session id, or exact name" }),
 });
 
 const SendSchema = Type.Object({
-	target: Type.String({ description: "Subagent run id, session id, or exact name" }),
+	target: Type.String({ description: "Subagent run id (or unique prefix), session id, or exact name" }),
 	message: Type.String({ description: "Instruction or follow-up to send to the subagent" }),
 });
 
@@ -288,13 +288,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	const resolveRecord = (target: string): AgentRecord => {
 		if (!runtime) throw new Error("Subagent extension settings failed to initialize");
 		const rows = descendantsOf(readRecords(getAgentDir()), runtime.runId);
-		const value = target.trim();
-		const matches = rows.filter((record) => record.runId === value || record.sessionId === value || record.name === value);
-		if (matches.length === 0) throw new Error(`No subagent matches "${value}".`);
-		if (matches.length > 1) {
-			throw new Error(`"${value}" is ambiguous; matches: ${matches.map((record) => `${record.name} (${shortId(record.runId)})`).join(", ")}`);
-		}
-		return matches[0]!;
+		return resolveAgentRecord(rows, target);
 	};
 
 	const sendToRecord = async (record: AgentRecord, text: string, signal?: AbortSignal): Promise<void> => {

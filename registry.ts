@@ -271,6 +271,18 @@ export function descendantsOf(records: readonly AgentRecord[], parentRunId: stri
 	return result;
 }
 
+/** Resolve exact identities first, then an unambiguous run-ID prefix. */
+export function resolveAgentRecord(records: readonly AgentRecord[], target: string): AgentRecord {
+	const value = target.trim();
+	const exact = value ? records.filter((record) => record.runId === value || record.sessionId === value || record.name === value) : [];
+	const matches = exact.length > 0 ? exact : value ? records.filter((record) => record.runId.startsWith(value)) : [];
+	if (matches.length === 0) throw new Error(`No subagent matches "${value}".`);
+	if (matches.length > 1) {
+		throw new Error(`"${value}" is ambiguous; matches: ${matches.map((record) => `${record.name} (${record.runId})`).join(", ")}`);
+	}
+	return matches[0]!;
+}
+
 export function relativeDepths(records: readonly AgentRecord[], parentRunId: string): Map<string, number> {
 	const depths = new Map<string, number>();
 	const byParent = new Map<string, AgentRecord[]>();
