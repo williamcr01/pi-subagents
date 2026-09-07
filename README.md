@@ -26,7 +26,7 @@ Install from npm with Pi:
 pi install npm:@williamcr01/pi-subagents
 ```
 
-This version requires Pi 0.83.0 or newer. Restart Pi or run `/reload` after installing. To install the latest published version explicitly:
+This version requires Pi 0.85.0 or newer. Restart Pi or run `/reload` after installing. To install the latest published version explicitly:
 
 ```sh
 pi update npm:@williamcr01/pi-subagents
