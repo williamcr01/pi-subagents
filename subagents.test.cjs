@@ -1,6 +1,6 @@
 // Regression tests for the subagents extension. No dependencies, no API calls.
 // Run: node subagents.test.cjs
-const { execSync, spawn: spawnProcess } = require("node:child_process");
+const { execSync, execFileSync, spawn: spawnProcess } = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -132,6 +132,43 @@ function check(name, cond, extra) {
 		let rejected = false;
 		try { registry.resolveAgentRecord(targets, target); } catch { rejected = true; }
 		check(`invalid target ${JSON.stringify(target)} rejected`, rejected);
+	}
+
+	// --- execution-scoped parent state (including legacy records) ---
+	{
+		const dir = path.join(sandbox, "result-state");
+		let owner = registry.saveRecord(dir, mk("result", "root", { latestText: "first" }));
+		const staleParent = { ...owner };
+		registry.markRecordResultState(dir, staleParent, "resultsDelivered");
+		registry.markRecordResultState(dir, staleParent, "footerDismissed");
+		owner = registry.saveRecord(dir, { ...owner, resultsDelivered: false, footerDismissed: false });
+		check("stale owner publish preserves both parent flags", owner.resultsDelivered && owner.footerDismissed);
+		const parsed = { finalText: "first" };
+		events.applyChildEvent(owner, parsed, { type: "agent_start" });
+		owner.latestText = "second in progress";
+		owner = registry.saveRecord(dir, owner);
+		check("agent_start resets legacy flags for a new execution", !!owner.executionId && !owner.resultsDelivered && !owner.footerDismissed);
+		const recordFile = path.join(registry.registryDir(dir), "result.json");
+		const before = fs.readFileSync(recordFile, "utf8");
+		// A separate process with an old terminal snapshot must write only old
+		// execution markers, never replace the newer execution's JSON.
+		execFileSync(process.execPath, ["-e", `
+			const { createJiti } = require(${JSON.stringify(path.join(PIN, "jiti"))});
+			const jiti = createJiti(${JSON.stringify(__filename)}, { fsCache: false });
+			(async () => {
+				const registry = await jiti.import(${JSON.stringify(path.join(HERE, "registry.ts"))});
+				const record = ${JSON.stringify(staleParent)};
+				registry.markRecordResultState(${JSON.stringify(dir)}, record, "resultsDelivered");
+				registry.markRecordResultState(${JSON.stringify(dir)}, record, "footerDismissed");
+			})();
+		`]);
+		check("cross-process stale UI writes leave execution JSON untouched", fs.readFileSync(recordFile, "utf8") === before);
+		const current = registry.readRecords(dir)[0];
+		check("old execution claims do not mark continuation", current.status === "thinking" && current.latestText === "second in progress" && !current.resultsDelivered && !current.footerDismissed);
+		registry.markRecordResultState(dir, current, "resultsDelivered");
+		registry.markRecordResultState(dir, current, "footerDismissed");
+		const closed = registry.clearRecordPid(dir, { ...owner, pid: process.pid });
+		check("clearRecordPid preserves current execution claims", closed.pid === undefined && closed.resultsDelivered && closed.footerDismissed);
 	}
 
 	// --- wait ---
@@ -698,6 +735,39 @@ function check(name, cond, extra) {
 	check("empty model scope emits no --models flag", !inheritedArgs.includes("--models"), JSON.stringify(inheritedArgs));
 	await new Promise((r) => setTimeout(r, 250));
 	check("onSettled fired", settled.includes("completed"), JSON.stringify(settled));
+
+	// Claim/dismiss at settlement while the owning process still has stale flags.
+	// A real child close must not resurrect either UI state.
+	const closeRec = await spawn.startSubagent({ task: "close after result" }, {
+		...baseCtx(), persistAfterSettled: false,
+		onSettled: (record) => {
+			registry.markRecordResultState(spawnAgentDir, { ...record }, "resultsDelivered");
+			registry.markRecordResultState(spawnAgentDir, { ...record }, "footerDismissed");
+		},
+	});
+	let closedResult;
+	for (let i = 0; i < 100; i++) {
+		closedResult = registry.readRecords(spawnAgentDir).find((r) => r.runId === closeRec.runId);
+		if (closedResult?.status === "completed" && closedResult.pid === undefined) break;
+		await waitSleep(25);
+	}
+	check("actual child close clears PID and preserves claimed/dismissed result", closedResult?.status === "completed" && closedResult.pid === undefined && closedResult.resultsDelivered && closedResult.footerDismissed);
+
+	// A persistent RPC child starts a genuinely new execution on continuation.
+	const previousResult = registry.readRecords(spawnAgentDir).find((r) => r.runId === rec1.runId);
+	registry.markRecordResultState(spawnAgentDir, previousResult, "resultsDelivered");
+	registry.markRecordResultState(spawnAgentDir, previousResult, "footerDismissed");
+	await spawn.sendSubagentMessage(previousResult, "next result");
+	let continued;
+	for (let i = 0; i < 100; i++) {
+		continued = registry.readRecords(spawnAgentDir).find((r) => r.runId === rec1.runId);
+		if (continued?.status === "completed" && continued.executionId !== previousResult.executionId) break;
+		await waitSleep(25);
+	}
+	registry.markRecordResultState(spawnAgentDir, previousResult, "resultsDelivered");
+	registry.markRecordResultState(spawnAgentDir, previousResult, "footerDismissed");
+	continued = registry.readRecords(spawnAgentDir).find((r) => r.runId === rec1.runId);
+	check("RPC continuation resets delivery and footer state despite stale claims", continued?.status === "completed" && continued.latestText === "steered: next result" && continued.executionId !== previousResult.executionId && !continued.resultsDelivered && !continued.footerDismissed);
 
 	const noToolsRec = await spawn.startSubagent({ task: "none", tools: [] }, baseCtx());
 	for (let i = 0; i < 100; i++) {

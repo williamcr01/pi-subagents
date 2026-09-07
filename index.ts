@@ -12,7 +12,7 @@ import { Type } from "typebox";
 import { currentDepth, loadSettings, THINKING_LEVEL_VALUES } from "./config.ts";
 import { consumeSubagentMessages, queueSubagentMessage } from "./control.ts";
 import { SubagentPanel } from "./panel.ts";
-import { isProcessAlive, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
+import { isProcessAlive, isTerminalStatus, markRecordResultState, readRecords } from "./registry.ts";
 import { notifyWaiters, waitUntilSubagentsIdle } from "./wait.ts";
 import {
 	cancelSubagent,
@@ -185,7 +185,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		);
 		for (const record of pending) {
 			try {
-				saveRecord(agentDir, { ...record, resultsDelivered: true, updatedAt: new Date().toISOString() });
+				markRecordResultState(agentDir, record, "resultsDelivered");
 			} catch {
 				// The message was accepted. Do not resend it in a tight loop when claim persistence fails.
 			}
@@ -487,7 +487,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				(record) => record.parentRunId === runtime!.runId && isTerminalStatus(record.status) && !record.resultsDelivered,
 			);
 			for (const record of newlyFinished) {
-				saveRecord(agentDir, { ...record, resultsDelivered: true, updatedAt: new Date().toISOString() });
+				markRecordResultState(agentDir, record, "resultsDelivered");
 			}
 			if (rows.length === 0) {
 				return { content: [{ type: "text", text: "No subagents have been spawned by this session." }], details: { records: [] } };

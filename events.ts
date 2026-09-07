@@ -1,3 +1,4 @@
+import { randomUUID } from "node:crypto";
 import type { AgentRecord, UsageSummary } from "./types.ts";
 
 const TEXT_LIMIT = 4000;
@@ -49,6 +50,7 @@ export function applyChildEvent(record: AgentRecord, state: ParsedChildState, ev
 			if (typeof event.id === "string") record.sessionId = event.id;
 			break;
 		case "agent_start":
+			record.executionId = randomUUID();
 			state.finalText = "";
 			state.stopReason = undefined;
 			state.errorMessage = undefined;

@@ -36,6 +36,8 @@ export interface AgentRecord {
 	depth: number;
 	maxDepth: number;
 	status: AgentStatus;
+	/** Fresh on each agent_start; scopes parent-owned result/UI markers to one execution. */
+	executionId?: string;
 	/** Set when the user started a newer turn: hide from the footer tree. History stays reviewable. */
 	footerDismissed?: boolean;
 	/** Set once this child's result has been delivered to the parent session. */

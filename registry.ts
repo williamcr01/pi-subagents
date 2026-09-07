@@ -79,8 +79,27 @@ function readCancellationMarker(agentDir: string, runId: string): CancellationMa
 	return { version: 1, runId, cancelledAt: new Date().toISOString(), error: "Cancelled" };
 }
 
+type ResultStateFlag = "resultsDelivered" | "footerDismissed";
+
+function resultStatePath(agentDir: string, record: AgentRecord, flag: ResultStateFlag): string {
+	return join(registryDir(agentDir), `${safeRunId(record.runId)}.${safeRunId(record.executionId ?? "legacy")}.${flag}`);
+}
+
+/**
+ * Parent/UI writes must never replace the execution owner's JSON snapshot.
+ * Each flag is an independent monotonic fact scoped to the observed execution,
+ * so even a delayed cross-process write cannot mark a newer turn or regress it.
+ */
+export function markRecordResultState(agentDir: string, record: AgentRecord, flag: ResultStateFlag): void {
+	mkdirSync(registryDir(agentDir), { recursive: true, mode: 0o700 });
+	atomicWrite(resultStatePath(agentDir, record, flag), "true\n");
+}
+
 function applyMarkers(agentDir: string, record: AgentRecord): AgentRecord {
 	let result = record;
+	for (const flag of ["resultsDelivered", "footerDismissed"] as const) {
+		if (existsSync(resultStatePath(agentDir, record, flag))) result = { ...result, [flag]: true };
+	}
 	const cancellation = readCancellationMarker(agentDir, record.runId);
 	if (cancellation) {
 		result = {
@@ -103,9 +122,10 @@ function applyMarkers(agentDir: string, record: AgentRecord): AgentRecord {
 }
 
 /**
- * Persist a record atomically. Cancellation and process-close marker files are
+ * Persist an execution-owner record atomically. Parent/UI flags must use
+ * markRecordResultState instead. Result flags, cancellation and close markers are
  * separate monotonic facts, so a stale writer in another process cannot undo
- * either state by replacing the JSON record later.
+ * these facts by replacing the JSON record later (within the same execution).
  */
 export function saveRecord(agentDir: string, record: AgentRecord): AgentRecord {
 	const dir = registryDir(agentDir);

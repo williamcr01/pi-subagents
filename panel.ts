@@ -15,7 +15,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { descendantsOf, isTerminalStatus, readRecords, saveRecord } from "./registry.ts";
+import { descendantsOf, isTerminalStatus, markRecordResultState, readRecords } from "./registry.ts";
 import { buildTranscript, discoverSessionFile } from "./transcript.ts";
 import type { AgentRecord } from "./types.ts";
 
@@ -159,7 +159,7 @@ export class SubagentPanel implements Component, Focusable {
 		for (const record of this.records) {
 			if (!isTerminal(record) || record.footerDismissed) continue;
 			try {
-				saveRecord(this.agentDir, { ...record, footerDismissed: true, updatedAt: new Date().toISOString() });
+				markRecordResultState(this.agentDir, record, "footerDismissed");
 				count++;
 			} catch {
 				// One bad write must not block the rest.
