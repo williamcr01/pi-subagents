@@ -10,7 +10,7 @@ import {
 import { Key, Markdown, matchesKey, Text, type EditorComponent } from "@earendil-works/pi-tui";
 import { Type } from "typebox";
 import { currentDepth, loadSettings, THINKING_LEVEL_VALUES } from "./config.ts";
-import { consumeSubagentMessages, queueSubagentMessage } from "./control.ts";
+import { requestOwnerMessage, startOwnerMessageConsumer } from "./owner-control.ts";
 import { SubagentPanel } from "./panel.ts";
 import { isProcessAlive, isTerminalStatus, markRecordResultState, readRecords } from "./registry.ts";
 import { notifyWaiters, waitUntilSubagentsIdle } from "./wait.ts";
@@ -111,7 +111,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
 	let deliveryRetryDelay = 1000;
 	let keepAlive: ReturnType<typeof setInterval> | undefined;
-	let inboxTimer: ReturnType<typeof setInterval> | undefined;
+	let stopOwnerConsumer: (() => Promise<void>) | undefined;
+	let sessionAbort = new AbortController();
+	let shuttingDown = false;
 	let previousEditorFactory: EditorFactory;
 	let installedEditorFactory: EditorFactory;
 
@@ -120,7 +122,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	/** Hold the event loop open while background children run (matters for print-mode parents). */
 	const refreshKeepAlive = () => {
-		if (!runtime) return;
+		if (!runtime || shuttingDown) return;
 		const pending = readRecords(getAgentDir()).some(
 			(record) => record.parentRunId === runtime!.runId && !isTerminalStatus(record.status),
 		);
@@ -134,7 +136,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	/** Deliver finished-but-undelivered child results to this session, debounced so parallel finishes batch into one message. */
 	const scheduleDelivery = (delay = 1000) => {
-		if (deliveryTimer) return;
+		if (deliveryTimer || shuttingDown) return;
 		deliveryTimer = setTimeout(async () => {
 			deliveryTimer = undefined;
 			try {
@@ -153,7 +155,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	};
 
 	const deliverResults = async () => {
-		if (!runtime) return;
+		if (!runtime || shuttingDown) return;
 		const agentDir = getAgentDir();
 		const children = readRecords(agentDir).filter((record) => record.parentRunId === runtime!.runId);
 		const pending = children.filter((record) => isTerminalStatus(record.status) && !record.resultsDelivered);
@@ -198,6 +200,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_start", (_event, ctx) => {
+		shuttingDown = false;
 		const runId = process.env.PI_SUBAGENT_RUN_ID || ctx.sessionManager.getSessionId();
 		const rootRunId = process.env.PI_SUBAGENT_ROOT_ID || runId;
 		try {
@@ -220,23 +223,18 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 		if (!runtime) return;
 
-		// Every subagent process consumes its own private inbox. This keeps
-		// steering recursive: the root UI can address grandchildren directly.
-		if (inboxTimer) clearInterval(inboxTimer);
-		inboxTimer = setInterval(() => {
-			if (!runtime) return;
-			for (const message of consumeSubagentMessages(getAgentDir(), runtime.runId, runtime.rootRunId)) {
-				try {
-					pi.sendUserMessage(message.text, {
-						...(ctx.isIdle() ? {} : { deliverAs: "steer" as const }),
-						expandPromptTemplates: true,
-					});
-				} catch {
-					// The sender will see the unchanged run status; never wedge the inbox.
-				}
+		// Recursive messages go to the target's owner, never directly to its
+		// input loop: only the owner can reserve/release its concurrency slot.
+		sessionAbort = new AbortController();
+		const owner = runtime;
+		stopOwnerConsumer = startOwnerMessageConsumer(getAgentDir(), owner.runId, owner.rootRunId, async (target, text, signal) => {
+			const record = readRecords(getAgentDir()).find((item) => item.runId === target);
+			if (!record || record.parentRunId !== owner.runId || record.rootRunId !== owner.rootRunId) {
+				throw new Error("Subagent is not owned by this session");
 			}
-		}, 150);
-		inboxTimer.unref?.();
+			if (record.status === "cancelled") throw new Error(`${record.name} was cancelled`);
+			if (!await sendSubagentMessage(record, text, signal)) throw new Error(`${record.name} is no longer running`);
+		});
 
 		if (ctx.mode !== "tui") return;
 
@@ -280,6 +278,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	const trackChild = (record: AgentRecord) => {
+		if (shuttingDown) return;
 		refreshKeepAlive();
 		notifyWaiters(getAgentDir());
 		if (isTerminalStatus(record.status)) scheduleDelivery();
@@ -293,16 +292,23 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	const sendToRecord = async (record: AgentRecord, text: string, signal?: AbortSignal): Promise<void> => {
 		if (!runtime) throw new Error("Subagent extension settings failed to initialize");
+		signal = signal ? AbortSignal.any([signal, sessionAbort.signal]) : sessionAbort.signal;
 		const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
 		if (latest.status === "cancelled") throw new Error(`${latest.name} was cancelled`);
 		if (await sendSubagentMessage(latest, text, signal)) return;
 		if (isTerminalStatus(latest.status) && (!latest.pid || !isProcessAlive(latest.pid))) {
 			throw new Error(`${latest.name} is no longer running`);
 		}
-		queueSubagentMessage(getAgentDir(), {
+		await requestOwnerMessage(getAgentDir(), latest.parentRunId, {
 			targetRunId: latest.runId,
 			rootRunId: runtime.rootRunId,
 			text,
+		}, {
+			signal,
+			ownerAlive: () => {
+				const owner = readRecords(getAgentDir()).find((item) => item.runId === latest.parentRunId);
+				return !!owner?.pid && isProcessAlive(owner.pid);
+			},
 		});
 	};
 
@@ -322,6 +328,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	});
 
 	pi.on("session_shutdown", async (_event, ctx) => {
+		shuttingDown = true;
 		panel?.dispose();
 		panel = undefined;
 		if (ctx.mode === "tui") {
@@ -340,10 +347,9 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			clearInterval(keepAlive);
 			keepAlive = undefined;
 		}
-		if (inboxTimer) {
-			clearInterval(inboxTimer);
-			inboxTimer = undefined;
-		}
+		sessionAbort.abort();
+		const consumerStopped = stopOwnerConsumer?.();
+		stopOwnerConsumer = undefined;
 		// This pi process is going away: stop every live descendant. Completed
 		// RPC children stay resumable only for the lifetime of their parent session.
 		if (!runtime) return;
@@ -361,6 +367,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			}
 		}
 		await terminateOwnedSubagents(records.map((record) => record.runId));
+		await consumerStopped;
 	});
 
 	pi.registerCommand("subagents", {

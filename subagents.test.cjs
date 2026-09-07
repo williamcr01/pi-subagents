@@ -712,6 +712,158 @@ function check(name, cond, extra) {
 	});
 	process.env.PI_SUBAGENT_COMMAND = fakePi;
 
+	// --- cross-process ancestor -> owner -> grandchild continuation admission ---
+	{
+		const ownerControl = await jiti.import(path.join(HERE, "owner-control.ts"));
+		const ownerDir = path.join(sandbox, "owner-control");
+		const ownerCtx = { ...baseCtx(), agentDir: ownerDir, parentRunId: "owner", rootRunId: "root", currentDepth: 1, settings: { maxDepth: 2, maxConcurrency: 1 } };
+		const row = (record) => registry.readRecords(ownerDir).find((r) => r.runId === record.runId);
+		const until = async (predicate) => {
+			for (let i = 0; i < 200; i++) {
+				if (predicate()) return;
+				await waitSleep(20);
+			}
+			throw new Error("owner integration timed out");
+		};
+		const consume = () => ownerControl.startOwnerMessageConsumer(ownerDir, "owner", "root", async (target, text, signal) => {
+			const record = registry.readRecords(ownerDir).find((r) => r.runId === target);
+			if (!record || record.parentRunId !== "owner") throw new Error("wrong owner");
+			if (!await spawn.sendSubagentMessage(record, text, signal)) throw new Error("not owned");
+		});
+		let stop = consume();
+		let ownerExitError;
+		const ownerExitStarted = Date.now();
+		try {
+			await ownerControl.requestOwnerMessage(ownerDir, "exited-owner", { rootRunId: "root", targetRunId: "old-child", text: "resume" }, { ownerAlive: () => false });
+		} catch (error) { ownerExitError = error.message; }
+		check("exited owner fails promptly instead of orphaning an inbox", ownerExitError?.includes("owner is no longer running") && Date.now() - ownerExitStarted < 500);
+		let ownerAlive = true;
+		ownerExitError = undefined;
+		setTimeout(() => { ownerAlive = false; }, 75);
+		try {
+			await ownerControl.requestOwnerMessage(ownerDir, "departing-owner", { rootRunId: "root", targetRunId: "old-child", text: "resume" }, { ownerAlive: () => ownerAlive });
+		} catch (error) { ownerExitError = error.message; }
+		check("owner exit while awaiting admission revokes request promptly", ownerExitError?.includes("owner is no longer running") && fs.readdirSync(path.join(ownerDir, "subagents", "owner-inbox", "departing-owner")).length === 0 && Date.now() - ownerExitStarted < 1000);
+		// This sender has its own module graph/process and cannot access the
+		// owner's liveChildren map or ConcurrencyGate.
+		const remote = (record, text, abortAfter = 0) => {
+			const script = `const { createJiti } = require(${JSON.stringify(path.join(PIN, "jiti"))});
+				createJiti(${JSON.stringify(__filename)}, { fsCache: false }).import(${JSON.stringify(path.join(HERE, "owner-control.ts"))}).then(async ({requestOwnerMessage}) => {
+				const abort = new AbortController();
+				if (${abortAfter}) setTimeout(() => abort.abort(), ${abortAfter});
+				try {
+					await requestOwnerMessage(${JSON.stringify(ownerDir)}, "owner", ${JSON.stringify({ rootRunId: "root", targetRunId: record.runId, text })}, { signal: abort.signal, ownerAlive: () => { try { process.kill(${process.pid}, 0); return true; } catch { return false; } }, timeoutMs: 5000 });
+					console.log("accepted");
+				} catch (error) { console.log("error: " + error.message); }
+			});`;
+			const child = spawnProcess(process.execPath, ["-e", script]);
+			let output = "";
+			child.stdout.on("data", (chunk) => output += chunk);
+			child.stderr.on("data", (chunk) => output += chunk);
+			const done = new Promise((resolve) => child.once("close", () => resolve(output.trim())));
+			return { child, done, output: () => output };
+		};
+		const g1 = await spawn.startSubagent({ task: "G1", name: "G1" }, ownerCtx);
+		await until(() => row(g1)?.status === "completed");
+		process.env.FAKE_DELAY_MS = "1500";
+		const g2 = await spawn.startSubagent({ task: "G2", name: "G2" }, ownerCtx);
+		delete process.env.FAKE_DELAY_MS;
+		await until(() => row(g2)?.status === "thinking");
+		const resume = remote(g1, "root resumes G1");
+		await until(() => row(g1)?.status === "queued");
+		check("cross-process continuation waits behind G2", row(g2)?.status === "thinking" && row(g1)?.latestText === "fake done" && !resume.output());
+		// An independent request is not blocked by the pending G1 admission.
+		const steer = remote(g2, "root steers G2");
+		check("recursive running steering bypasses waiting continuation", await steer.done === "accepted");
+		check("cross-process continuation acknowledged after admission", await resume.done === "accepted");
+		await until(() => row(g1)?.status === "completed" && row(g1)?.latestText === "steered: root resumes G1");
+		check("cross-process continuation executed exactly through owner", row(g1).latestText === "steered: root resumes G1");
+		await spawn.terminateOwnedSubagents([g2.runId]);
+
+		// Occupy the owner's gate deterministically for cancellation/error cases.
+		let releaseBlock = await spawn.gate.acquire(1);
+		const aborted = remote(g1, "must not execute", 250);
+		await until(() => row(g1)?.status === "queued");
+		check("sender abort rejects queued cross-process continuation", (await aborted.done).includes("aborted"));
+		await until(() => row(g1)?.status === "completed");
+		releaseBlock();
+		check("sender abort preserves prior result", row(g1)?.latestText === "steered: root resumes G1");
+		check("sender abort removes gate waiter", !spawn.gate.isFull(1));
+
+		releaseBlock = await spawn.gate.acquire(1);
+		const deadSender = remote(g1, "dead sender continuation");
+		await until(() => row(g1)?.status === "queued");
+		deadSender.child.kill("SIGKILL");
+		await deadSender.done;
+		await until(() => row(g1)?.status === "completed");
+		releaseBlock();
+		check("sender death revokes waiting continuation without slot leak", !spawn.gate.isFull(1) && row(g1)?.latestText === "steered: root resumes G1");
+
+		const rejected = remote(g1, "reject");
+		check("owner RPC rejection reaches ancestor", (await rejected.done).includes("fake rejection"));
+		check("rejected continuation releases slot", !spawn.gate.isFull(1) && row(g1)?.status === "completed");
+
+		releaseBlock = await spawn.gate.acquire(1);
+		const cancelled = remote(g1, "cancelled continuation");
+		await until(() => row(g1)?.status === "queued");
+		spawn.cancelSubagent(ownerDir, row(g1));
+		check("target cancellation rejects pending ancestor request", (await cancelled.done).includes("aborted"));
+		await spawn.terminateOwnedSubagents([g1.runId]);
+		releaseBlock();
+		check("target cancellation does not leak slot", !spawn.gate.isFull(1));
+
+		releaseBlock = await spawn.gate.acquire(1);
+		const queued = await spawn.startSubagent({ task: "queued startup" }, ownerCtx);
+		const queuedSteer = remote(queued, "startup steering");
+		check("cross-process startup steering is retained while queued", await queuedSteer.done === "accepted" && row(queued)?.status === "queued");
+		releaseBlock();
+		await until(() => row(queued)?.status === "completed" && row(queued)?.latestText === "steered: startup steering");
+		check("queued startup delivers retained ancestor steering", row(queued)?.latestText === "steered: startup steering");
+		await spawn.terminateOwnedSubagents([queued.runId]);
+
+		const g3 = await spawn.startSubagent({ task: "shutdown target" }, ownerCtx);
+		await until(() => row(g3)?.status === "completed");
+		releaseBlock = await spawn.gate.acquire(1);
+		const shutdown = remote(g3, "shutdown continuation");
+		await until(() => row(g3)?.status === "queued");
+		await stop();
+		check("owner shutdown rejects queued ancestor request", (await shutdown.done).includes("aborted"));
+		await spawn.terminateOwnedSubagents([g3.runId]);
+		releaseBlock();
+		check("owner shutdown does not leak slot", !spawn.gate.isFull(1));
+		const inbox = path.join(ownerDir, "subagents", "owner-inbox", "owner");
+		check("request acknowledgements and cancellations leave no files", fs.readdirSync(inbox).length === 0);
+		// Race the polling consumer against malformed-file revocation.
+		stop = consume();
+		const cleanupRacer = spawnProcess(process.execPath, ["-e", `
+			const fs = require("node:fs"), path = require("node:path");
+			const base = ${JSON.stringify(inbox)};
+			for (let i = 0; i < 1000; i++) {
+				fs.rmSync(base, { recursive: true, force: true });
+				const dir = path.join(base, "malformed");
+				fs.mkdirSync(dir, { recursive: true });
+				try { fs.writeFileSync(path.join(dir, "request.json"), "{"); } catch {}
+			}
+			fs.rmSync(base, { recursive: true, force: true });
+		`], { stdio: "ignore" });
+		const cleanupCode = await new Promise((resolve) => cleanupRacer.once("close", resolve));
+		await stop();
+		check("consumer survives concurrent malformed request cleanup", cleanupCode === 0);
+		let deliveries = 0;
+		const ackBase = path.join(ownerDir, "subagents", "owner-inbox", "ack-owner");
+		stop = ownerControl.startOwnerMessageConsumer(ownerDir, "ack-owner", "root", async () => {
+			deliveries++;
+			// Force response persistence failure after accepting the message.
+			for (const name of fs.readdirSync(ackBase)) fs.mkdirSync(path.join(ackBase, name, "response.tmp"));
+		});
+		let ackError;
+		try {
+			await ownerControl.requestOwnerMessage(ownerDir, "ack-owner", { rootRunId: "root", targetRunId: "target", text: "once" }, { ownerAlive: () => true, timeoutMs: 300 });
+		} catch (error) { ackError = error.message; }
+		await stop();
+		check("failed acknowledgement never replays accepted prompt", deliveries === 1 && ackError?.includes("timed out"));
+	}
+
 	// --- project trust follows canonical paths ---
 	const fakeArgsDir = path.join(sandbox, "trust-args");
 	process.env.FAKE_ARGS_DIR = fakeArgsDir;

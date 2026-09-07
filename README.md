@@ -106,7 +106,7 @@ check_subagents({ wait: true, timeoutMs: 120000 })
 
 ### `send_to_subagent`
 
-Steer a running child or continue its completed session by exact name, run ID, or session ID:
+Steer a running child or continue its completed session by exact name, run ID, or session ID. Messages to deeper descendants are acknowledged by their creating session after RPC acceptance (or retention during queued startup). Cross-process admission waits are cancellable and time out after five minutes; cancellation does not undo a prompt already accepted:
 
 ```text
 send_to_subagent({ target: "auth-reviewer", message: "Focus on the token refresh path." })
@@ -138,7 +138,7 @@ All fields are optional. Defaults are `maxDepth: 2` and `maxConcurrency: 4`.
 - `defaultModel` — fallback model for spawns that omit `model`.
 - `defaultThinking` — fallback thinking level for spawns that omit `thinking`.
 - `maxDepth` — maximum recursive depth. The root is depth `0`; `maxDepth: 0` disables spawning. Descendants inherit the root limit and may only tighten it.
-- `maxConcurrency` — number of children allowed to run at once. Use `-1` for unlimited or a positive integer for a limit; extra children queue automatically.
+- `maxConcurrency` — number of children allowed to run at once per creating session. Use `-1` for unlimited or a positive integer for a limit; extra children queue automatically. Resuming a completed child also waits for its creator's slot, even when an ancestor sends the follow-up. Steering a running child does not require another slot.
 - `rpcMaxLineChars` — defensive limit per child stdout JSONL record, default `67108864` (64 Mi UTF-16 code units, including an optional trailing CR but excluding LF). Must be a positive safe integer; there is no unlimited mode. Set it in global or trusted-project `subagents.json`, for example `"rpcMaxLineChars": 134217728` for unusually large workloads.
 
 Pi RPC embeds base64 images in tool/message events and aggregates messages in `turn_end` and `agent_end`. The 64 Mi default allows several multi-megabyte images and aggregate results that exceed ordinary text-output limits; it is a client safety bound, not a Pi protocol maximum. Both terminated and unterminated records exceeding it fail the child with an explicit error. Input is checked before buffering, scanned incrementally, and discarded on failure. Memory remains proportional to the configured bound (UTF-16 storage, joining, and JSON parsing can require several times the record size per concurrent child); raise it cautiously or reduce concurrency. LF-only framing and split UTF-8 decoding are preserved.
@@ -179,7 +179,8 @@ Source files are organized by responsibility:
 - `registry.ts` — atomic run records
 - `wait.ts` — event-driven wait for descendant completion (`check_subagents` wait:true)
 - `spawn-agent.ts` — RPC process control, concurrency, cancellation, and depth enforcement
-- `control.ts` — atomic descendant message inboxes
+- `owner-control.ts` — cross-process requests/acknowledgements routed through the target's creating session; revoked requests abort pending admission
+- `control.ts` — legacy inbox helpers (not used by the runtime)
 - `events.ts` — child JSON event parsing and status updates
 - `panel.ts` — footer tree, selection, and transcript detail view
 - `transcript.ts` — rendering child session files
