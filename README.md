@@ -106,7 +106,7 @@ check_subagents({ wait: true, timeoutMs: 120000 })
 
 ### `send_to_subagent`
 
-Steer a running child or continue its completed session by exact name, run ID, or session ID. Messages to deeper descendants are acknowledged by their creating session after RPC acceptance (or retention during queued startup). Cross-process admission waits are cancellable and time out after five minutes; cancellation does not undo a prompt already accepted:
+Steer a running child or continue its completed session by exact name, run ID, unique run-ID prefix, or session ID. Messages to deeper descendants are acknowledged by their creating session after RPC acceptance (or retention during queued startup). Cross-process admission waits are cancellable and time out after five minutes; cancellation does not undo a prompt already accepted, and the creator keeps the concurrency slot until that turn settles:
 
 ```text
 send_to_subagent({ target: "auth-reviewer", message: "Focus on the token refresh path." })
@@ -180,7 +180,6 @@ Source files are organized by responsibility:
 - `wait.ts` — event-driven wait for descendant completion (`check_subagents` wait:true)
 - `spawn-agent.ts` — RPC process control, concurrency, cancellation, and depth enforcement
 - `owner-control.ts` — cross-process requests/acknowledgements routed through the target's creating session; revoked requests abort pending admission
-- `control.ts` — legacy inbox helpers (not used by the runtime)
 - `events.ts` — child JSON event parsing and status updates
 - `panel.ts` — footer tree, selection, and transcript detail view
 - `transcript.ts` — rendering child session files

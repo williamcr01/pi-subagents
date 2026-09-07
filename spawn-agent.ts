@@ -770,25 +770,36 @@ async function runSubagentProcess(
 						publish();
 					}
 					let releaseTurn: (() => void) | undefined;
+					let promptIssued = false;
 					try {
 						releaseTurn = followUp ? await gate.acquire(context.settings.maxConcurrency, signal) : undefined;
 						if (releaseTurn) continuationReleases.push(releaseTurn);
 						if (signal?.aborted || closing || diskCancelled()) throw new Error("Subagent message was aborted");
-						await send(
+						const pendingPrompt = send(
 							{
 								type: "prompt",
 								message,
 								...(followUp ? {} : { streamingBehavior: "steer" }),
 							},
-							{ signal },
+							// Once a follow-up is on stdin, the child owns the turn. Caller abort
+							// must not drop the slot; agent_settled/close still release it.
+							{ signal: followUp ? lifetime.signal : signal },
 						);
+						promptIssued = true;
+						await pendingPrompt;
 					} catch (error) {
-						if (releaseTurn) {
+						const keepSlot =
+							followUp &&
+							promptIssued &&
+							!!releaseTurn &&
+							error instanceof Error &&
+							/aborted/.test(error.message);
+						if (releaseTurn && !keepSlot) {
 							const index = continuationReleases.indexOf(releaseTurn);
 							if (index >= 0) continuationReleases.splice(index, 1);
 							releaseTurn();
 						}
-						if (followUp && record.status === "queued" && !diskCancelled()) {
+						if (followUp && !promptIssued && record.status === "queued" && !diskCancelled()) {
 							record.status = previousStatus;
 							record.activity = previousStatus;
 							publish();

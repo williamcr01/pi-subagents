@@ -41,7 +41,6 @@ function check(name, cond, extra) {
 	const config = await jiti.import(path.join(HERE, "config.ts"));
 	const registry = await jiti.import(path.join(HERE, "registry.ts"));
 	const events = await jiti.import(path.join(HERE, "events.ts"));
-	const control = await jiti.import(path.join(HERE, "control.ts"));
 	const spawn = await jiti.import(path.join(HERE, "spawn-agent.ts"));
 	const wait = await jiti.import(path.join(HERE, "wait.ts"));
 	const { SubagentPanel } = await jiti.import(path.join(HERE, "panel.ts"));
@@ -541,11 +540,6 @@ function check(name, cond, extra) {
 	editorHandlers.get("session_shutdown")?.({}, { mode: "tui", ui: editorUi });
 	check("session shutdown restores the previous custom editor", currentEditorFactory === originalEditorFactory);
 
-	// --- control inbox ---
-	control.queueSubagentMessage(agentDir2, { targetRunId: "child1", rootRunId: "root", text: "change direction" });
-	const inbox = control.consumeSubagentMessages(agentDir2, "child1", "root");
-	check("control inbox delivers message", inbox.length === 1 && inbox[0].text === "change direction", JSON.stringify(inbox));
-	check("control inbox consumes once", control.consumeSubagentMessages(agentDir2, "child1", "root").length === 0);
 	registry.saveRecord(agentDir2, mk("child1", "root", { status: "thinking" }));
 	registry.saveRecord(agentDir2, mk("grand", "child1", { status: "running_tool" }));
 	const child1StaleWriter = registry.readRecords(agentDir2).find((r) => r.runId === "child1");
@@ -862,6 +856,19 @@ function check(name, cond, extra) {
 		} catch (error) { ackError = error.message; }
 		await stop();
 		check("failed acknowledgement never replays accepted prompt", deliveries === 1 && ackError?.includes("timed out"));
+
+		const kept = await spawn.startSubagent({ task: "keep-slot", name: "keep-slot" }, ownerCtx);
+		await until(() => row(kept)?.status === "completed");
+		const abort = new AbortController();
+		const sending = spawn.sendSubagentMessage(kept, "delay-rpc 400", abort.signal);
+		await until(() => spawn.gate.isFull(1));
+		abort.abort();
+		check("accepted prompt keeps the owner slot after caller abort", spawn.gate.isFull(1) && row(kept)?.status !== "completed", row(kept)?.status);
+		let sendErr;
+		try { await sending; } catch (error) { sendErr = error; }
+		await until(() => row(kept)?.status === "completed" && String(row(kept)?.latestText).includes("delay-rpc"));
+		check("accepted continuation finishes despite caller abort", String(row(kept)?.latestText).includes("delay-rpc") && !spawn.gate.isFull(1) && !sendErr, sendErr?.message || row(kept)?.latestText);
+		await spawn.terminateOwnedSubagents([kept.runId]);
 	}
 
 	// --- project trust follows canonical paths ---

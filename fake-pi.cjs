@@ -117,6 +117,14 @@ process.stdin.on("data", (chunk) => {
 			}
 		} else if (command.type === "prompt" || command.type === "steer" || command.type === "follow_up") {
 			if (command.message === "hang") continue;
+			if (typeof command.message === "string" && command.message.startsWith("delay-rpc ")) {
+				const ms = Number(command.message.slice("delay-rpc ".length));
+				setTimeout(() => {
+					line({ type: "response", id: command.id, command: command.type, success: true });
+					run(command.message, command.streamingBehavior ? "steer" : command.type);
+				}, Number.isFinite(ms) && ms >= 0 ? ms : 250);
+				continue;
+			}
 			if (command.message === "reject") {
 				line({ type: "response", id: command.id, command: command.type, success: false, error: "fake rejection" });
 				continue;
