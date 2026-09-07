@@ -4,7 +4,7 @@ import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "n
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
-import { validateThinkingLevel } from "./config.ts";
+import { DEFAULT_SETTINGS, validateRpcMaxLineChars, validateThinkingLevel } from "./config.ts";
 import { applyChildEvent, type ParsedChildState } from "./events.ts";
 import {
 	clearRecordPid,
@@ -22,7 +22,6 @@ const STDERR_LIMIT = 4000;
 const TERMINATION_WAIT_MS = 5000;
 const RPC_REQUEST_TIMEOUT_MS = 15_000;
 const RPC_STARTUP_TIMEOUT_MS = 30_000;
-const STDOUT_LINE_LIMIT = 1024 * 1024;
 
 export class ConcurrencyGate {
 	private running = 0;
@@ -603,7 +602,8 @@ async function runSubagentProcess(
 		else args.push("--no-tools");
 
 		let stderr = "";
-		let buffer = "";
+		let lineParts: string[] = [];
+		let lineLength = 0;
 		let transportError: string | undefined;
 		let requestId = 0;
 		let initialSettled = false;
@@ -626,7 +626,10 @@ async function runSubagentProcess(
 		const stderrDecoder = new StringDecoder("utf8");
 		const requestTimeoutMs = Math.max(1, context.rpcRequestTimeoutMs ?? RPC_REQUEST_TIMEOUT_MS);
 		const startupDeadline = Date.now() + Math.max(1, context.rpcStartupTimeoutMs ?? RPC_STARTUP_TIMEOUT_MS);
-		const stdoutLineLimit = Math.max(1, context.stdoutLineLimit ?? STDOUT_LINE_LIMIT);
+		const stdoutLineLimit = validateRpcMaxLineChars(
+			context.stdoutLineLimit ?? context.settings.rpcMaxLineChars ?? DEFAULT_SETTINGS.rpcMaxLineChars,
+			"rpcMaxLineChars",
+		);
 
 		let child: ChildProcessWithoutNullStreams | undefined;
 		withRecordLock(context.agentDir, record.runId, () => {
@@ -676,6 +679,8 @@ async function runSubagentProcess(
 		const failTransport = (error: Error) => {
 			if (transportError) return;
 			transportError = error.message;
+			lineParts = [];
+			lineLength = 0;
 			rejectPending(error);
 			if (closing) return;
 			launchedChild.stdin.destroy();
@@ -830,23 +835,25 @@ async function runSubagentProcess(
 
 		const consumeStdout = (text: string) => {
 			if (!text || transportError) return;
-			buffer += text;
-			while (true) {
-				const newline = buffer.indexOf("\n");
-				if (newline < 0) {
-					if (buffer.length > stdoutLineLimit) {
-						failTransport(new Error(`Subagent RPC stdout line exceeded ${stdoutLineLimit} characters`));
-					}
+			// Scan each chunk once; don't repeatedly copy/scan a growing image payload.
+			let start = 0;
+			while (start < text.length && !transportError) {
+				const newline = text.indexOf("\n", start);
+				const end = newline < 0 ? text.length : newline;
+				const length = end - start;
+				if (lineLength + length > stdoutLineLimit) {
+					failTransport(new Error(`Subagent RPC stdout line exceeded ${stdoutLineLimit} characters (rpcMaxLineChars)`));
 					return;
 				}
-				if (newline > stdoutLineLimit) {
-					failTransport(new Error(`Subagent RPC stdout line exceeded ${stdoutLineLimit} characters`));
-					return;
-				}
-				let line = buffer.slice(0, newline);
-				buffer = buffer.slice(newline + 1);
+				if (length) lineParts.push(text.slice(start, end));
+				lineLength += length;
+				if (newline < 0) return;
+				let line = lineParts.join("");
+				lineParts = [];
+				lineLength = 0;
 				if (line.endsWith("\r")) line = line.slice(0, -1);
 				processLine(line);
+				start = newline + 1;
 			}
 		};
 		launchedChild.stdout.on("data", (chunk: Buffer) => {
@@ -862,7 +869,9 @@ async function runSubagentProcess(
 			for (const releaseTurn of continuationReleases.splice(0)) releaseTurn();
 			consumeStdout(stdoutDecoder.end());
 			stderr = `${stderr}${stderrDecoder.end()}`.slice(-STDERR_LIMIT);
-			if (!transportError && buffer.trim()) processLine(buffer);
+			if (!transportError && lineLength) processLine(lineParts.join(""));
+			lineParts = [];
+			lineLength = 0;
 			const exitError = new Error(transportError || stderr.trim() || `Subagent exited with code ${code ?? 1}`);
 			rejectPending(exitError);
 			const wasCancelled = record.status === "cancelled" || diskCancelled();

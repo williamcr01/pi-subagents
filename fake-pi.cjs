@@ -50,8 +50,16 @@ function run(message, kind = "prompt") {
 				timestamp: Date.now(),
 			},
 		};
+		const imageResult = {
+			role: "toolResult", toolCallId: "image-1", toolName: "read",
+			content: [{ type: "image", mimeType: "image/png", data: mode.startsWith("large-") ? "AAAA".repeat(512 * 1024) : "" }],
+			isError: false, timestamp: Date.now(),
+		};
+		if (mode === "large-image") {
+			line({ type: "tool_execution_end", toolCallId: "image-1", toolName: "read", result: imageResult, isError: false });
+		}
 		const settle = () => {
-			line({ type: "agent_end", messages: [] });
+			line({ type: "agent_end", messages: mode === "large-aggregate" ? [imageResult, imageResult, messageEnd.message] : [] });
 			line({ type: "agent_settled" });
 		};
 		if (mode === "split-utf8") {

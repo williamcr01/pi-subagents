@@ -139,6 +139,9 @@ All fields are optional. Defaults are `maxDepth: 2` and `maxConcurrency: 4`.
 - `defaultThinking` — fallback thinking level for spawns that omit `thinking`.
 - `maxDepth` — maximum recursive depth. The root is depth `0`; `maxDepth: 0` disables spawning. Descendants inherit the root limit and may only tighten it.
 - `maxConcurrency` — number of children allowed to run at once. Use `-1` for unlimited or a positive integer for a limit; extra children queue automatically.
+- `rpcMaxLineChars` — defensive limit per child stdout JSONL record, default `67108864` (64 Mi UTF-16 code units, including an optional trailing CR but excluding LF). Must be a positive safe integer; there is no unlimited mode. Set it in global or trusted-project `subagents.json`, for example `"rpcMaxLineChars": 134217728` for unusually large workloads.
+
+Pi RPC embeds base64 images in tool/message events and aggregates messages in `turn_end` and `agent_end`. The 64 Mi default allows several multi-megabyte images and aggregate results that exceed ordinary text-output limits; it is a client safety bound, not a Pi protocol maximum. Both terminated and unterminated records exceeding it fail the child with an explicit error. Input is checked before buffering, scanned incrementally, and discarded on failure. Memory remains proportional to the configured bound (UTF-16 storage, joining, and JSON parsing can require several times the record size per concurrent child); raise it cautiously or reduce concurrency. LF-only framing and split UTF-8 decoding are preserved.
 
 The `--subagent-depth N` Pi flag overrides configured depth for the tree. An inherited depth limit can never be raised by a descendant.
 

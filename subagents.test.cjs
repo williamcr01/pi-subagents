@@ -52,6 +52,14 @@ function check(name, cond, extra) {
 	const agentDir = path.join(sandbox, "agent");
 	fs.mkdirSync(agentDir, { recursive: true });
 	let s = config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: false, env: {} });
+	check("default RPC bound is 64 Mi characters", s.rpcMaxLineChars === 64 * 1024 * 1024);
+	for (const value of [0, -1, 1.5, Infinity, NaN, Number.MAX_SAFE_INTEGER + 1, "1024", null]) {
+		let threw = false;
+		try { config.validateRpcMaxLineChars(value, "test"); } catch { threw = true; }
+		check(`invalid RPC bound ${String(value)} rejected`, threw);
+	}
+	fs.writeFileSync(path.join(agentDir, "subagents.json"), JSON.stringify({ rpcMaxLineChars: 12345 }));
+	check("RPC bound loads from configuration", config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: false, env: {} }).rpcMaxLineChars === 12345);
 	check("defaults maxDepth=2", s.maxDepth === 2, s.maxDepth);
 	check("defaults maxConcurrency=4", s.maxConcurrency === 4, s.maxConcurrency);
 
@@ -909,6 +917,28 @@ function check(name, cond, extra) {
 		await new Promise((r) => setTimeout(r, 25));
 	}
 	check("RPC stdin errors fail without waiting for deadline", writeDone?.status === "failed" && !writeDone.error?.includes("timed out"), writeDone && `${writeDone.status} ${writeDone.error}`);
+
+	for (const mode of ["large-image", "large-aggregate"]) {
+		for (const limit of [undefined, 1024 * 1024]) {
+			process.env.FAKE_MODE = mode;
+			const rec = await spawn.startSubagent(
+				{ task: "image payload", name: mode },
+				{ ...baseCtx(), persistAfterSettled: false, settings: { ...baseCtx().settings, rpcMaxLineChars: limit } },
+			);
+			delete process.env.FAKE_MODE;
+			let done;
+			for (let i = 0; i < 200; i++) {
+				done = registry.readRecords(spawnAgentDir).find((r) => r.runId === rec.runId);
+				if (done && ["completed", "failed"].includes(done.status) && !done.pid) break;
+				await new Promise((r) => setTimeout(r, 25));
+			}
+			check(`${mode} ${limit ? "fails above configured bound" : "completes above 1 MiB"}`,
+				limit ? done?.status === "failed" && done.error?.includes(`stdout line exceeded ${limit}`)
+					: done?.status === "completed" && done.latestText === (process.env.FAKE_TEXT ?? "fake done"),
+				done && `${done.status} ${done.error ?? done.latestText}`);
+			check(`${mode} child closed after payload test`, !done?.pid);
+		}
+	}
 
 	process.env.FAKE_MODE = "oversized-line";
 	process.env.FAKE_LINE_LENGTH = "4096";

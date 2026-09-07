@@ -57,6 +57,8 @@ export interface SubagentSettings {
 	defaultThinking?: string;
 	maxDepth: number;
 	maxConcurrency: number;
+	/** Maximum UTF-16 code units per child RPC stdout record (default 64 Mi). */
+	rpcMaxLineChars?: number;
 }
 
 export interface SpawnAgentInput {
