@@ -653,6 +653,7 @@ async function runSubagentProcess(
 					PI_SUBAGENT_ROOT_ID: context.rootRunId,
 					PI_SUBAGENT_DEPTH: String(record.depth),
 					PI_SUBAGENT_MAX_DEPTH: String(context.settings.maxDepth),
+					PI_SUBAGENT_DEPTH_FLAG_OVERRIDE: context.settings.maxDepthFlagOverride ? "1" : "0",
 				},
 			});
 			ownChild(record.runId, child);

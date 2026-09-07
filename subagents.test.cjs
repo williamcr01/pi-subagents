@@ -63,6 +63,49 @@ function check(name, cond, extra) {
 	check("defaults maxDepth=2", s.maxDepth === 2, s.maxDepth);
 	check("defaults maxConcurrency=4", s.maxConcurrency === 4, s.maxConcurrency);
 
+	// Model the effective limit exported by each spawn, without forwarding flags.
+	const depthOptions = { agentDir, cwd: sandbox, projectTrusted: false };
+	const inheritDepth = (settings) => ({
+		PI_SUBAGENT_MAX_DEPTH: String(settings.maxDepth),
+		PI_SUBAGENT_DEPTH_FLAG_OVERRIDE: settings.maxDepthFlagOverride ? "1" : "0",
+	});
+	const fallbackDepth = config.loadSettings({ ...depthOptions, env: { PI_SUBAGENT_MAX_DEPTH: "4" } });
+	check("defaults do not tighten unflagged inheritance", fallbackDepth.maxDepth === 4, fallbackDepth.maxDepth);
+	const rootDepth = config.loadSettings({ ...depthOptions, depthFlag: "4", env: {} });
+	check("root flag raises default depth", rootDepth.maxDepth === 4, rootDepth.maxDepth);
+	const childDepth = config.loadSettings({ ...depthOptions, env: inheritDepth(rootDepth) });
+	check("child preserves root flag above default", childDepth.maxDepth === 4, childDepth.maxDepth);
+	const grandchildDepth = config.loadSettings({ ...depthOptions, env: inheritDepth(childDepth) });
+	check("grandchild preserves root flag above default", grandchildDepth.maxDepth === 4, grandchildDepth.maxDepth);
+	const tightenedDepth = config.loadSettings({ ...depthOptions, depthFlag: "3", env: inheritDepth(childDepth) });
+	check("explicit descendant flag tightens inherited depth", tightenedDepth.maxDepth === 3, tightenedDepth.maxDepth);
+	const tightenedGrandchild = config.loadSettings({ ...depthOptions, env: inheritDepth(tightenedDepth) });
+	check("grandchild preserves tightened depth", tightenedGrandchild.maxDepth === 3, tightenedGrandchild.maxDepth);
+	const raisedGrandchild = config.loadSettings({ ...depthOptions, depthFlag: "9", env: inheritDepth(tightenedDepth) });
+	check("grandchild cannot raise tightened depth", raisedGrandchild.maxDepth === 3, raisedGrandchild.maxDepth);
+	const disabledDepth = config.loadSettings({ ...depthOptions, depthFlag: "0", env: inheritDepth(childDepth) });
+	check("explicit descendant zero disables spawning", disabledDepth.maxDepth === 0, disabledDepth.maxDepth);
+	const disabledGrandchild = config.loadSettings({ ...depthOptions, depthFlag: "4", env: inheritDepth(disabledDepth) });
+	check("inherited zero cannot be raised", disabledGrandchild.maxDepth === 0, disabledGrandchild.maxDepth);
+
+	fs.mkdirSync(path.join(sandbox, ".pi"), { recursive: true });
+	fs.writeFileSync(path.join(sandbox, ".pi", "subagents.json"), JSON.stringify({ maxDepth: 2 }));
+	fs.writeFileSync(path.join(agentDir, "subagents.json"), JSON.stringify({ maxDepth: 4 }));
+	const unflaggedRoot = config.loadSettings({ ...depthOptions, env: {} });
+	const restrictedChild = config.loadSettings({ ...depthOptions, projectTrusted: true, env: inheritDepth(unflaggedRoot) });
+	check("root global4 without flag permits child project2 restriction", restrictedChild.maxDepth === 2, restrictedChild.maxDepth);
+	const restrictedGrandchild = config.loadSettings({ ...depthOptions, env: inheritDepth(restrictedChild) });
+	check("larger global config cannot raise child restriction", restrictedGrandchild.maxDepth === 2, restrictedGrandchild.maxDepth);
+	fs.writeFileSync(path.join(agentDir, "subagents.json"), JSON.stringify({ maxDepth: 2 }));
+	const globalRestrictedChild = config.loadSettings({ ...depthOptions, env: inheritDepth(unflaggedRoot) });
+	check("explicit global config tightens unflagged inheritance", globalRestrictedChild.maxDepth === 2, globalRestrictedChild.maxDepth);
+	const configuredRoot = config.loadSettings({ ...depthOptions, projectTrusted: true, depthFlag: "4", env: {} });
+	check("root flag overrides lower global config", configuredRoot.maxDepth === 4, configuredRoot.maxDepth);
+	const configuredChild = config.loadSettings({ ...depthOptions, projectTrusted: true, env: inheritDepth(configuredRoot) });
+	check("global config cannot undo inherited root flag", configuredChild.maxDepth === 4, configuredChild.maxDepth);
+	const configuredGrandchild = config.loadSettings({ ...depthOptions, projectTrusted: true, env: inheritDepth(configuredChild) });
+	check("global config cannot undo root flag in grandchild", configuredGrandchild.maxDepth === 4, configuredGrandchild.maxDepth);
+
 	fs.writeFileSync(path.join(agentDir, "subagents.json"), JSON.stringify({ defaultModel: "a/b", maxDepth: 5, maxConcurrency: 2 }));
 	fs.mkdirSync(path.join(sandbox, ".pi"), { recursive: true });
 	fs.writeFileSync(path.join(sandbox, ".pi", "subagents.json"), JSON.stringify({ maxDepth: 9 }));
@@ -74,6 +117,15 @@ function check(name, cond, extra) {
 	check("flag wins", s.maxDepth === 3, s.maxDepth);
 	s = config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: true, depthFlag: "30", env: { PI_SUBAGENT_MAX_DEPTH: "4" } });
 	check("inherited caps flag", s.maxDepth === 4, s.maxDepth);
+	s = config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: true, env: { PI_SUBAGENT_MAX_DEPTH: "4" } });
+	check("project config cannot raise inherited depth", s.maxDepth === 4, s.maxDepth);
+	fs.writeFileSync(path.join(sandbox, ".pi", "subagents.json"), JSON.stringify({ maxDepth: 1 }));
+	s = config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: true, env: { PI_SUBAGENT_MAX_DEPTH: "4" } });
+	check("project config tightens unflagged inherited depth", s.maxDepth === 1, s.maxDepth);
+	s = config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: true, env: inheritDepth(rootDepth) });
+	check("project config cannot undo inherited flag override", s.maxDepth === 4, s.maxDepth);
+	s = config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: true, depthFlag: "2", env: { PI_SUBAGENT_MAX_DEPTH: "4" } });
+	check("descendant flag still tightens with conflicting config", s.maxDepth === 2, s.maxDepth);
 
 	fs.writeFileSync(path.join(agentDir, "subagents.json"), JSON.stringify({ maxConcurrency: -1, maxDepth: 100 }));
 	s = config.loadSettings({ agentDir, cwd: sandbox, projectTrusted: false, env: {} });
@@ -776,6 +828,23 @@ function check(name, cond, extra) {
 	registry.markRecordResultState(spawnAgentDir, previousResult, "footerDismissed");
 	continued = registry.readRecords(spawnAgentDir).find((r) => r.runId === rec1.runId);
 	check("RPC continuation resets delivery and footer state despite stale claims", continued?.status === "completed" && continued.latestText === "steered: next result" && continued.executionId !== previousResult.executionId && !continued.resultsDelivered && !continued.footerDismissed);
+
+	// Verify the real spawn environment, then reload it as a child/grandchild.
+	const unflaggedSpawnEnv = JSON.parse(fs.readFileSync(path.join(fakeArgsDir, `${rec1.runId}.env.json`), "utf8"));
+	check("unflagged spawn exports no flag override", unflaggedSpawnEnv.PI_SUBAGENT_DEPTH_FLAG_OVERRIDE === "0");
+	let propagatedSettings = configuredRoot;
+	for (const generation of ["child", "grandchild"]) {
+		const depthRec = await spawn.startSubagent({ task: "depth propagation" }, {
+			...baseCtx(), settings: propagatedSettings, persistAfterSettled: false,
+		});
+		const envPath = path.join(fakeArgsDir, `${depthRec.runId}.env.json`);
+		for (let i = 0; i < 100 && !fs.existsSync(envPath); i++) await new Promise((r) => setTimeout(r, 25));
+		const depthEnv = JSON.parse(fs.readFileSync(envPath, "utf8"));
+		check(`${generation} spawn exports effective cap and flag provenance`,
+			depthEnv.PI_SUBAGENT_MAX_DEPTH === "4" && depthEnv.PI_SUBAGENT_DEPTH_FLAG_OVERRIDE === "1", JSON.stringify(depthEnv));
+		propagatedSettings = config.loadSettings({ ...depthOptions, projectTrusted: true, env: depthEnv });
+		check(`${generation} reload retains flag cap over file limits`, propagatedSettings.maxDepth === 4, propagatedSettings.maxDepth);
+	}
 
 	const noToolsRec = await spawn.startSubagent({ task: "none", tools: [] }, baseCtx());
 	for (let i = 0; i < 100; i++) {

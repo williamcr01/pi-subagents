@@ -24,6 +24,16 @@ if (process.env.FAKE_ARGS_DIR && process.env.PI_SUBAGENT_RUN_ID) {
 	);
 }
 
+if (process.env.FAKE_ARGS_DIR && process.env.PI_SUBAGENT_RUN_ID) {
+	require("node:fs").writeFileSync(
+		require("node:path").join(process.env.FAKE_ARGS_DIR, `${process.env.PI_SUBAGENT_RUN_ID}.env.json`),
+		JSON.stringify({
+			PI_SUBAGENT_MAX_DEPTH: process.env.PI_SUBAGENT_MAX_DEPTH,
+			PI_SUBAGENT_DEPTH_FLAG_OVERRIDE: process.env.PI_SUBAGENT_DEPTH_FLAG_OVERRIDE,
+		}),
+	);
+}
+
 const line = (obj) => process.stdout.write(`${JSON.stringify(obj)}\n`);
 
 let runCount = 0;

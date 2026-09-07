@@ -143,7 +143,7 @@ All fields are optional. Defaults are `maxDepth: 2` and `maxConcurrency: 4`.
 
 Pi RPC embeds base64 images in tool/message events and aggregates messages in `turn_end` and `agent_end`. The 64 Mi default allows several multi-megabyte images and aggregate results that exceed ordinary text-output limits; it is a client safety bound, not a Pi protocol maximum. Both terminated and unterminated records exceeding it fail the child with an explicit error. Input is checked before buffering, scanned incrementally, and discarded on failure. Memory remains proportional to the configured bound (UTF-16 storage, joining, and JSON parsing can require several times the record size per concurrent child); raise it cautiously or reduce concurrency. LF-only framing and split UTF-8 decoding are preserved.
 
-The `--subagent-depth N` Pi flag overrides configured depth for the tree. An inherited depth limit can never be raised by a descendant.
+The `--subagent-depth N` Pi flag overrides configured depth for the tree; descendants inherit that override rather than reapplying file limits. Without a flag override, explicit global or trusted-project depth settings may tighten the inherited limit. Built-in defaults never tighten an inherited limit. An explicit descendant `--subagent-depth N` may also tighten the limit and overrides file limits for its subtree. No descendant can raise an inherited limit.
 
 ## Footer controls
 

@@ -53,6 +53,8 @@ export interface AgentRecord {
 }
 
 export interface SubagentSettings {
+	/** Runtime provenance: a depth flag overrides file limits throughout its subtree. */
+	maxDepthFlagOverride?: boolean;
 	defaultModel?: string;
 	defaultThinking?: string;
 	maxDepth: number;

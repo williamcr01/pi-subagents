@@ -98,7 +98,13 @@ export function loadSettings(options: {
 
 	const inheritedDepth = envNumber(env.PI_SUBAGENT_MAX_DEPTH, depth, "PI_SUBAGENT_MAX_DEPTH");
 	const flagDepth = options.depthFlag === undefined ? undefined : depth(Number(options.depthFlag), "--subagent-depth");
-	const configuredDepth = flagDepth ?? merged.maxDepth;
+	const maxDepthFlagOverride = flagDepth !== undefined ||
+		(inheritedDepth !== undefined && env.PI_SUBAGENT_DEPTH_FLAG_OVERRIDE === "1");
+	// A flag overrides file configuration throughout its subtree. Without one,
+	// explicit file limits may tighten inheritance, but built-in defaults may not.
+	const configuredDepth = flagDepth ??
+		(maxDepthFlagOverride ? inheritedDepth : project.maxDepth ?? global.maxDepth) ??
+		inheritedDepth ?? DEFAULT_SETTINGS.maxDepth;
 	const envThinking = env.PI_SUBAGENT_DEFAULT_THINKING
 		? validateThinkingLevel(env.PI_SUBAGENT_DEFAULT_THINKING, "PI_SUBAGENT_DEFAULT_THINKING")
 		: undefined;
@@ -107,8 +113,9 @@ export function loadSettings(options: {
 		...merged,
 		defaultModel: env.PI_SUBAGENT_DEFAULT_MODEL || merged.defaultModel,
 		defaultThinking: envThinking ?? merged.defaultThinking,
-		// Descendants inherit the root's effective limit and can only tighten it.
+		// Neither file configuration nor a descendant flag may raise inheritance.
 		maxDepth: inheritedDepth === undefined ? configuredDepth : Math.min(inheritedDepth, configuredDepth),
+		maxDepthFlagOverride,
 		maxConcurrency: merged.maxConcurrency,
 	};
 }
