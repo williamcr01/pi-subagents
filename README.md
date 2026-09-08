@@ -14,7 +14,7 @@ Recursive, isolated, asynchronous subagents for the [Pi coding agent](https://gi
 - **Live monitoring** — the footer shows a recursive status tree with provider/model, activity, and elapsed time.
 - **Interactive transcripts** — open any child to read its complete Pi session from the original delegation prompt, including messages and tool calls.
 - **Steering and follow-ups** — message a running child to redirect it, or message a finished child to continue its existing session.
-- **Automatic delivery** — finished results are sent back to the parent when it goes idle; `check_subagents` can collect them explicitly.
+- **Automatic delivery** — finished results arrive with the next completed parent tool result. An idle parent receives one batch and resumes. `check_subagents` can collect pending results explicitly.
 - **Cancellation** — stop a running or queued child by run ID, session ID, or name.
 - **No added dependencies** — uses Pi's extension and TUI APIs plus Node.js built-ins.
 
@@ -96,7 +96,7 @@ Thinking level follows the same precedence and is clamped to the selected child 
 
 ### `check_subagents`
 
-Inspect descendants and collect newly finished results without repeating results already delivered. Use `wait: true` before relying on work that is still running:
+Inspect descendants and collect newly finished results without repeating results already delivered. Each ancestor sees a descendant execution once, without claiming the direct parent's result. Use `wait: true` before relying on work that is still running:
 
 ```text
 check_subagents({ wait: true, timeoutMs: 120000 })
@@ -119,6 +119,12 @@ Stop a child by exact name, run ID, or session ID:
 ```text
 cancel_subagent({ target: "auth-reviewer" })
 ```
+
+## Result delivery
+
+While the parent works, finished child reports stay in the registry until a completed parent tool result or `check_subagents` consumes them. Automatic delivery appends reports to the tool output without steering the parent or skipping sibling tool calls. If the parent becomes idle first, it receives the pending reports in one message that starts a new turn.
+
+This replaces the previous behavior of queueing a separate follow-up prompt for every completion. Reports no longer accumulate behind a long parent run and replay after its final answer. If a child completes several follow-ups before the parent consumes its report, only the latest execution is delivered. Earlier output remains available in the child's transcript.
 
 ## Configuration
 

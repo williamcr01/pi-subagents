@@ -5,6 +5,18 @@ const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
 
+// Install before jiti imports node:fs, which captures named function exports.
+let failMarkerWritesFor;
+let injectedMarkerFailures = 0;
+const realRenameSync = fs.renameSync;
+fs.renameSync = (from, to) => {
+	if (failMarkerWritesFor && String(to).includes(failMarkerWritesFor) && String(to).endsWith(".resultsDelivered")) {
+		injectedMarkerFailures++;
+		throw new Error("injected marker write failure");
+	}
+	return realRenameSync(from, to);
+};
+
 function findPiRoot() {
 	const bin = execSync("command -v pi", { encoding: "utf8" }).trim();
 	const real = fs.realpathSync(bin);
@@ -418,6 +430,10 @@ function check(name, cond, extra) {
 		check("root claims its direct child result", afterRootOwnership.find((r) => r.runId === "owner-child")?.resultsDelivered === true);
 		check("root does not claim grandchild result", afterRootOwnership.find((r) => r.runId === "owner-grand")?.resultsDelivered !== true);
 		check("root can inspect grandchild result read-only", rootOwnershipText.includes("grandchild result") && rootOwnershipText.includes("read-only descendant"), rootOwnershipText);
+		const rootRepeat = await checkTool.execute("check-owner-repeat", {}, undefined, undefined, {});
+		check("root does not repeat an unclaimed descendant execution", !rootRepeat.content[0].text.includes("grandchild result"));
+		check("root observation keeps direct parent ownership", registry.readRecords(checkAgentDir).find((r) => r.runId === "owner-grand")?.resultsDelivered !== true);
+		check("check persists observed descendant keys", rootOwnershipCheck.details.seenDescendantResults.length === 1);
 
 		const childHandlers = new Map();
 		const childTools = new Map();
@@ -485,6 +501,86 @@ function check(name, cond, extra) {
 		for (let i = 0; i < 100 && asyncAutomaticSendAttempts < 2; i++) await new Promise((r) => setTimeout(r, 25));
 		check("async failed automatic send is retried", asyncAutomaticSendAttempts >= 2, String(asyncAutomaticSendAttempts));
 		check("successful async automatic retry claims result", registry.readRecords(checkAgentDir).find((r) => r.runId === "async-retry-child")?.resultsDelivered === true);
+
+		// A busy parent must not queue reports behind its final answer or hide
+		// them from checks. Model a real Pi follow-up queue, not immediate delivery.
+		const queuedReports = [];
+		checkPi.sendMessage = (message, options) => queuedReports.push({ message, options });
+		checkHandlers.get("agent_start")({}, {});
+		registry.saveRecord(checkAgentDir, checkRecord("busy-check", "thinking"));
+		await checkTools.get("cancel_subagent").execute("cancel-busy", { target: "busy-check" }, undefined, undefined, {});
+		await new Promise((r) => setTimeout(r, 1100));
+		check("busy parent does not queue automatic follow-ups", queuedReports.length === 0);
+		check("busy result remains available for explicit check", registry.readRecords(checkAgentDir).find((r) => r.runId === "busy-check")?.resultsDelivered !== true);
+		const busyCheck = await checkTool.execute("busy-check", {}, undefined, undefined, {});
+		check("explicit check consumes a result while parent is busy", busyCheck.content[0].text.includes("### busy-check"));
+
+		registry.saveRecord(checkAgentDir, checkRecord("boundary-child", "completed", { latestText: "fresh boundary result", executionId: "first" }));
+		const toolEvent = { toolName: "read", content: [{ type: "text", text: "original tool output" }] };
+		const aborted = new AbortController(); aborted.abort();
+		const abortedDelivery = checkHandlers.get("tool_result")(toolEvent, { signal: aborted.signal });
+		check("aborted tool boundary does not consume reports", abortedDelivery === undefined && !registry.readRecords(checkAgentDir).find((r) => r.runId === "boundary-child")?.resultsDelivered);
+		checkHandlers.get("agent_settled")();
+		await new Promise((r) => setTimeout(r, 50));
+		check("Esc does not wake the parent with pending reports", queuedReports.length === 0);
+		checkHandlers.get("agent_start")({}, {});
+		const boundary = checkHandlers.get("tool_result")(toolEvent, {});
+		check("tool boundary preserves original output", boundary.content[0].text === "original tool output");
+		check("tool boundary includes fresh report", boundary.content[1].text.includes("fresh boundary result"));
+		check("next sibling tool result does not repeat report", checkHandlers.get("tool_result")(toolEvent, {}) === undefined);
+		const afterBoundary = await checkTool.execute("after-boundary", {}, undefined, undefined, {});
+		check("check does not repeat boundary-delivered report", !afterBoundary.content[0].text.includes("fresh boundary result"));
+
+		// Repeated executions replace the unread snapshot rather than creating
+		// one queued prompt per completion.
+		registry.saveRecord(checkAgentDir, checkRecord("boundary-child", "completed", { latestText: "superseded result", executionId: "second" }));
+		registry.saveRecord(checkAgentDir, checkRecord("boundary-child", "completed", { latestText: "latest result", executionId: "third" }));
+		registry.saveRecord(checkAgentDir, checkRecord("idle-batch", "completed", { latestText: "other result" }));
+		checkHandlers.get("agent_settled")();
+		await new Promise((r) => setTimeout(r, 50));
+		check("settled parent receives one fresh batch", queuedReports.length === 1);
+		check("idle batch uses latest execution only", queuedReports[0]?.message.content.includes("latest result") && !queuedReports[0]?.message.content.includes("superseded result"));
+		check("idle batch contains other finished child", queuedReports[0]?.message.content.includes("other result"));
+		check("idle batch still wakes the parent", queuedReports[0]?.options.triggerTurn === true);
+		checkHandlers.get("agent_settled")();
+		await new Promise((r) => setTimeout(r, 50));
+		check("settling after acknowledgement does not replay reports", queuedReports.length === 1);
+
+		registry.saveRecord(checkAgentDir, mk("owner-grand", "owner-child", {
+			rootRunId: "check-parent", depth: 2, status: "completed", latestText: "new grandchild execution", executionId: "new-execution",
+		}));
+		const newDescendant = await checkTool.execute("new-descendant", {}, undefined, undefined, {});
+		check("root sees a new descendant execution", newDescendant.content[0].text.includes("new grandchild execution"));
+		checkHandlers.get("session_tree")({}, { sessionManager: { getBranch: () => [] } });
+		const beforeReceipt = await checkTool.execute("before-receipt", {}, undefined, undefined, {});
+		check("tree before receipt makes descendant visible again", beforeReceipt.content[0].text.includes("new grandchild execution"));
+		checkHandlers.get("session_tree")({}, { sessionManager: { getBranch: () => [
+			{ type: "message", message: { role: "toolResult", toolName: "check_subagents", details: newDescendant.details } },
+		] } });
+		check("tree restores descendant receipt", !(await checkTool.execute("restored-receipt", {}, undefined, undefined, {})).content[0].text.includes("new grandchild execution"));
+
+		checkHandlers.get("agent_start")({}, {});
+		registry.saveRecord(checkAgentDir, checkRecord("marker-good", "completed", { latestText: "good marker report" }));
+		registry.saveRecord(checkAgentDir, checkRecord("marker-failure", "completed", { latestText: "failed marker report" }));
+		let faultResult;
+		try {
+			failMarkerWritesFor = "marker-failure";
+			faultResult = checkHandlers.get("tool_result")(toolEvent, {});
+		} finally { failMarkerWritesFor = undefined; }
+		check("marker failure injection exercised", injectedMarkerFailures === 1);
+		check("partial marker failure preserves all reports", faultResult.content[1].text.includes("good marker report") && faultResult.content[1].text.includes("failed marker report"));
+		check("in-memory receipt prevents failed-marker replay", checkHandlers.get("tool_result")(toolEvent, {}) === undefined);
+		check("tool result contains durable delivery receipts", faultResult.details.resultKeys.length === 2);
+		await checkHandlers.get("session_shutdown")({}, { mode: "rpc" });
+		await checkHandlers.get("session_start")({}, {
+			sessionManager: {
+				getSessionId: () => "check-parent",
+				getBranch: () => [{ type: "message", message: { role: "toolResult", toolName: "read", details: faultResult.details } }],
+			},
+			cwd: sandbox, isProjectTrusted: () => false, mode: "rpc", hasUI: false,
+		});
+		const restoredDirect = await checkTool.execute("restored-direct", {}, undefined, undefined, {});
+		check("reload restores delivery after marker failure", !restoredDirect.content[0].text.includes("failed marker report"));
 	} finally {
 		checkHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
