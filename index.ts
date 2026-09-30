@@ -95,12 +95,6 @@ const SendSchema = Type.Object({
 	message: Type.String({ description: "Instruction or follow-up to send to the subagent" }),
 });
 
-const RESULT_OUTPUT_CAP = 8000;
-
-function cap(text: string, limit: number): string {
-	return text.length <= limit ? text : `${text.slice(0, limit - 1)}…`;
-}
-
 function shortId(runId: string): string {
 	return runId.slice(0, 8);
 }
@@ -227,10 +221,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		const stillRunning = children.filter((record) => !isTerminalStatus(record.status)).length;
 		const parts = pending.map((record) => {
 			const head = `### ${record.name} — ${record.status}`;
-			const body =
-				record.status === "completed"
-					? cap(record.latestText || "(no output)", RESULT_OUTPUT_CAP)
-					: cap(record.error || record.status, RESULT_OUTPUT_CAP);
+			const body = record.status === "completed" ? record.latestText || "(no output)" : record.error || record.status;
 			return `${head}\n\n${body}`;
 		});
 		const intro =
@@ -301,7 +292,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		if (pending.length === 0) return;
 		const text = pending.map((record) => {
 			const body = record.status === "completed" ? record.latestText || "(no output)" : record.error || record.status;
-			return `### ${record.name} — ${record.status}\n\n${cap(body, RESULT_OUTPUT_CAP)}`;
+			return `### ${record.name} — ${record.status}\n\n${body}`;
 		}).join("\n\n");
 		rememberPreviewed(pending);
 		return {
@@ -682,10 +673,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					const meta = `${record.model} · depth ${record.depth}/${record.maxDepth} · ${record.cwd}${record.runId ? ` · run ${shortId(record.runId)}` : ""}${readOnly}`;
 					let body: string;
 					if (isTerminalStatus(record.status)) {
-						body =
-							record.status === "completed"
-								? cap(record.latestText || "(no output)", RESULT_OUTPUT_CAP)
-								: cap(record.error || record.status, RESULT_OUTPUT_CAP);
+						body = record.status === "completed" ? record.latestText || "(no output)" : record.error || record.status;
 					} else {
 						body = `still running: ${record.currentTool || record.activity || record.status}`;
 					}

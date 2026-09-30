@@ -422,6 +422,14 @@ function check(name, cond, extra) {
 		check("later check omits all delivered results", !thirdText.includes("first result") && !thirdText.includes("second result"), thirdText);
 		check("later check explains no new results", thirdText.includes("No new subagent results since the last check."), thirdText);
 
+		// Results are delivered in full: long reports must not be cap-truncated.
+		const longTail = "END-OF-LONG-RESULT";
+		const longResult = `${"x".repeat(9000)}${longTail}`;
+		registry.saveRecord(checkAgentDir, checkRecord("long-result", "completed", { latestText: longResult }));
+		const longCheck = await checkTool.execute("check-long", { wait: false }, undefined, undefined, {});
+		const longText = longCheck.content[0].text;
+		check("long results are delivered without truncation", longText.includes(longResult), `len=${longText.length}`);
+
 		// A recursive result belongs to its direct parent, even when the root can inspect it.
 		registry.saveRecord(checkAgentDir, checkRecord("owner-child", "completed", { latestText: "child result" }));
 		registry.saveRecord(checkAgentDir, mk("owner-grand", "owner-child", {
