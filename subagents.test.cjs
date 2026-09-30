@@ -537,6 +537,33 @@ function check(name, cond, extra) {
 		const afterBoundaryAgain = await checkTool.execute("after-boundary-again", {}, undefined, undefined, {});
 		check("check omits a report it already collected", !afterBoundaryAgain.content[0].text.includes("fresh boundary result"));
 
+		// Pi 0.99 deletes structuredContent when a handler replaces `content` unless the
+		// handler returns it too. Preserve it so outputSchema tools (codemode, MCP) keep working.
+		registry.saveRecord(checkAgentDir, checkRecord("structured-child", "completed", { latestText: "structured result", executionId: "sc1" }));
+		const structuredBoundary = checkHandlers.get("tool_result")({
+			toolName: "codemode",
+			content: [{ type: "text", text: "original structured output" }],
+			structuredContent: { answer: 42 },
+		}, {});
+		check("tool boundary preserves structured content", structuredBoundary?.structuredContent?.answer === 42, JSON.stringify(structuredBoundary?.structuredContent));
+		check("tool boundary appends report next to structured content", structuredBoundary?.content?.[1]?.text?.includes("structured result"));
+		await checkTool.execute("structured-collect", {}, undefined, undefined, {});
+
+		// Pi 0.99 emits `tool_result` for nested calls made through ctx.executeTool()
+		// (for example from codemode). They are not the parent's completed tool, so the
+		// handler must skip them instead of claiming a preview on their behalf.
+		registry.saveRecord(checkAgentDir, checkRecord("nested-child", "completed", { latestText: "nested result", executionId: "n1" }));
+		const nestedBoundary = checkHandlers.get("tool_result")({
+			toolName: "read",
+			parentToolCallId: "call-outer/1",
+			content: [{ type: "text", text: "nested output" }],
+		}, {});
+		check(
+			"nested tool results are not previewed",
+			nestedBoundary === undefined && registry.readRecords(checkAgentDir).find((r) => r.runId === "nested-child")?.resultsPreviewed !== true,
+		);
+		await checkTool.execute("nested-collect", {}, undefined, undefined, {});
+
 		// A default check is never a pointless wait: it blocks only while a result can
 		// still arrive, and returns at the first finished report.
 		registry.saveRecord(checkAgentDir, checkRecord("wait-child", "thinking", { activity: "working" }));
@@ -1311,12 +1338,30 @@ function check(name, cond, extra) {
 		if (boundedDone?.status === "completed") break;
 		await new Promise((r) => setTimeout(r, 25));
 	}
+	// Caller abort is still honored while the child is running: a steering send
+	// rejects promptly instead of waiting for its RPC deadline.
+	process.env.FAKE_DELAY_MS = "1500";
+	const abortRec = await spawn.startSubagent(
+		{ task: "steer target", name: "abort-child" },
+		{ ...baseCtx(), rpcRequestTimeoutMs: 100 },
+	);
+	delete process.env.FAKE_DELAY_MS;
+	let abortRow;
+	for (let i = 0; i < 100; i++) {
+		abortRow = registry.readRecords(spawnAgentDir).find((r) => r.runId === abortRec.runId);
+		if (abortRow?.status === "thinking") break;
+		await new Promise((r) => setTimeout(r, 10));
+	}
 	const abortController = new AbortController();
 	const abortTimer = setTimeout(() => abortController.abort(), 50);
 	let abortError;
-	try { await spawn.sendSubagentMessage(boundedDone, "hang", abortController.signal); } catch (error) { abortError = String(error); }
+	try { await spawn.sendSubagentMessage(abortRow, "hang", abortController.signal); } catch (error) { abortError = String(error); }
 	clearTimeout(abortTimer);
-	check("aborted RPC request rejects promptly", abortError?.includes("aborted"), abortError);
+	check("aborted steering request rejects promptly", abortError?.includes("aborted"), abortError);
+	await spawn.terminateOwnedSubagents([abortRec.runId]);
+
+	// Once a follow-up prompt is written, the child owns the turn, so only the RPC
+	// deadline bounds the caller's request.
 	let requestError;
 	try { await spawn.sendSubagentMessage(boundedDone, "hang"); } catch (error) { requestError = String(error); }
 	check("RPC requests have a deadline", requestError?.includes("request timed out"), requestError);

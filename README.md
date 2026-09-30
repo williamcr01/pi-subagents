@@ -27,7 +27,7 @@ Install from npm with Pi:
 pi install npm:@williamcr01/pi-subagents
 ```
 
-This version requires Pi 0.85.0 or newer. Restart Pi or run `/reload` after installing. To install the latest published version explicitly:
+This version requires Pi 0.85.0 or newer (tested through 0.99.x). Restart Pi or run `/reload` after installing. To install the latest published version explicitly:
 
 ```sh
 pi update npm:@williamcr01/pi-subagents
@@ -130,6 +130,8 @@ cancel_subagent({ target: "auth-reviewer" })
 While the parent works, finished child reports stay in the registry until a completed parent tool result previews them, an idle batch delivers them, or `check_subagents` collects them. Automatic delivery appends reports to the tool output without steering the parent or skipping sibling tool calls. If the parent becomes idle first, it receives the pending reports in one message that starts a new turn.
 
 A tool-output append is a best-effort preview. It stops the same report from being appended again, but the report remains collectable by `check_subagents` until a check returns it or an idle batch delivers it. This keeps the model from losing a result that was buried in unrelated tool output while still avoiding duplicate automatic deliveries.
+
+On Pi 0.99+, the preview keeps a tool's structured content intact, so tools that declare an output schema (such as codemode or MCP tools) do not lose it. Nested calls a tool makes through `ctx.executeTool()` are skipped; only the model-visible outer tool result carries the preview.
 
 This replaces the previous behavior of queueing a separate follow-up prompt for every completion. Reports no longer accumulate behind a long parent run and replay after its final answer. If a child completes several follow-ups before the parent consumes its report, only the latest execution is delivered. Earlier output remains available in the child's transcript.
 

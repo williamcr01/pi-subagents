@@ -280,6 +280,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	pi.on("tool_result", (event, ctx) => {
 		if (ctx.signal?.aborted) { deliveryPaused = true; return; }
 		if (!runtime || shuttingDown || delivering || deliveryPaused) return;
+		// Pi 0.99 emits `tool_result` for nested calls made through `ctx.executeTool()`
+		// (for example from codemode). Skip them: the outer call's result is the one the
+		// model sees, and appending here would only bloat its bounded `nestedCalls`.
+		if (event.parentToolCallId !== undefined) return;
 		// Custom tools may use scalar/array details. Leave their result shape alone.
 		if (event.details !== undefined && (!event.details || typeof event.details !== "object" || Array.isArray(event.details))) return;
 		const details = event.details as Record<string, unknown> | undefined;
@@ -303,6 +307,10 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		return {
 			content: [...event.content, { type: "text" as const, text: `Subagent results (preview; collect with check_subagents if needed):\n\n${text}` }],
 			details: { ...details, previewResultKeys: [...previousKeys, ...pending.map(resultKey)] },
+			// Since 0.99, replacing `content` without returning `structuredContent` drops it.
+			// Preserve the structured result for tools that declare an `outputSchema`
+			// (codemode, MCP) so appending a preview does not change their contract.
+			...(event.structuredContent !== undefined ? { structuredContent: event.structuredContent } : {}),
 		};
 	});
 

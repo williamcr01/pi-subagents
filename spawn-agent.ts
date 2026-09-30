@@ -779,7 +779,11 @@ async function runSubagentProcess(
 							if (index >= 0) continuationReleases.splice(index, 1);
 							releaseTurn();
 						}
-						if (followUp && !promptIssued && record.status === "queued" && !diskCancelled()) {
+						// A rejected or aborted follow-up never started a turn, so the child is
+						// still in its previous state: only the optimistic "queued" publish needs
+						// undoing. Once the child accepts the prompt, agent_start moves it off
+						// "queued" and this must not overwrite that newer state.
+						if (followUp && record.status === "queued" && !diskCancelled()) {
 							record.status = previousStatus;
 							record.activity = previousStatus;
 							publish();
