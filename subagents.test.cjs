@@ -10,7 +10,7 @@ let failMarkerWritesFor;
 let injectedMarkerFailures = 0;
 const realRenameSync = fs.renameSync;
 fs.renameSync = (from, to) => {
-	if (failMarkerWritesFor && String(to).includes(failMarkerWritesFor) && String(to).endsWith(".resultsDelivered")) {
+	if (failMarkerWritesFor && String(to).includes(failMarkerWritesFor) && /\.(resultsDelivered|resultsPreviewed)$/.test(String(to))) {
 		injectedMarkerFailures++;
 		throw new Error("injected marker write failure");
 	}
@@ -211,14 +211,15 @@ function check(name, cond, extra) {
 		let owner = registry.saveRecord(dir, mk("result", "root", { latestText: "first" }));
 		const staleParent = { ...owner };
 		registry.markRecordResultState(dir, staleParent, "resultsDelivered");
+		registry.markRecordResultState(dir, staleParent, "resultsPreviewed");
 		registry.markRecordResultState(dir, staleParent, "footerDismissed");
-		owner = registry.saveRecord(dir, { ...owner, resultsDelivered: false, footerDismissed: false });
-		check("stale owner publish preserves both parent flags", owner.resultsDelivered && owner.footerDismissed);
+		owner = registry.saveRecord(dir, { ...owner, resultsDelivered: false, resultsPreviewed: false, footerDismissed: false });
+		check("stale owner publish preserves all parent flags", owner.resultsDelivered && owner.resultsPreviewed && owner.footerDismissed);
 		const parsed = { finalText: "first" };
 		events.applyChildEvent(owner, parsed, { type: "agent_start" });
 		owner.latestText = "second in progress";
 		owner = registry.saveRecord(dir, owner);
-		check("agent_start resets legacy flags for a new execution", !!owner.executionId && !owner.resultsDelivered && !owner.footerDismissed);
+		check("agent_start resets legacy flags for a new execution", !!owner.executionId && !owner.resultsDelivered && !owner.resultsPreviewed && !owner.footerDismissed);
 		const recordFile = path.join(registry.registryDir(dir), "result.json");
 		const before = fs.readFileSync(recordFile, "utf8");
 		// A separate process with an old terminal snapshot must write only old
@@ -230,16 +231,18 @@ function check(name, cond, extra) {
 				const registry = await jiti.import(${JSON.stringify(path.join(HERE, "registry.ts"))});
 				const record = ${JSON.stringify(staleParent)};
 				registry.markRecordResultState(${JSON.stringify(dir)}, record, "resultsDelivered");
+				registry.markRecordResultState(${JSON.stringify(dir)}, record, "resultsPreviewed");
 				registry.markRecordResultState(${JSON.stringify(dir)}, record, "footerDismissed");
 			})();
 		`]);
 		check("cross-process stale UI writes leave execution JSON untouched", fs.readFileSync(recordFile, "utf8") === before);
 		const current = registry.readRecords(dir)[0];
-		check("old execution claims do not mark continuation", current.status === "thinking" && current.latestText === "second in progress" && !current.resultsDelivered && !current.footerDismissed);
+		check("old execution claims do not mark continuation", current.status === "thinking" && current.latestText === "second in progress" && !current.resultsDelivered && !current.resultsPreviewed && !current.footerDismissed);
 		registry.markRecordResultState(dir, current, "resultsDelivered");
+		registry.markRecordResultState(dir, current, "resultsPreviewed");
 		registry.markRecordResultState(dir, current, "footerDismissed");
 		const closed = registry.clearRecordPid(dir, { ...owner, pid: process.pid });
-		check("clearRecordPid preserves current execution claims", closed.pid === undefined && closed.resultsDelivered && closed.footerDismissed);
+		check("clearRecordPid preserves current execution claims", closed.pid === undefined && closed.resultsDelivered && closed.resultsPreviewed && closed.footerDismissed);
 	}
 
 	// --- wait ---
@@ -527,9 +530,70 @@ function check(name, cond, extra) {
 		const boundary = checkHandlers.get("tool_result")(toolEvent, {});
 		check("tool boundary preserves original output", boundary.content[0].text === "original tool output");
 		check("tool boundary includes fresh report", boundary.content[1].text.includes("fresh boundary result"));
+		check("tool boundary is a preview, not a claim", registry.readRecords(checkAgentDir).find((r) => r.runId === "boundary-child")?.resultsDelivered !== true && registry.readRecords(checkAgentDir).find((r) => r.runId === "boundary-child")?.resultsPreviewed === true);
 		check("next sibling tool result does not repeat report", checkHandlers.get("tool_result")(toolEvent, {}) === undefined);
 		const afterBoundary = await checkTool.execute("after-boundary", {}, undefined, undefined, {});
-		check("check does not repeat boundary-delivered report", !afterBoundary.content[0].text.includes("fresh boundary result"));
+		check("check returns a boundary-previewed report once", afterBoundary.content[0].text.includes("fresh boundary result"));
+		const afterBoundaryAgain = await checkTool.execute("after-boundary-again", {}, undefined, undefined, {});
+		check("check omits a report it already collected", !afterBoundaryAgain.content[0].text.includes("fresh boundary result"));
+
+		// A default check is never a pointless wait: it blocks only while a result can
+		// still arrive, and returns at the first finished report.
+		registry.saveRecord(checkAgentDir, checkRecord("wait-child", "thinking", { activity: "working" }));
+		const waitChildStarted = Date.now();
+		const waitDefault = checkTool.execute("wait-default", {}, undefined, undefined, {});
+		setTimeout(() => {
+			registry.saveRecord(checkAgentDir, checkRecord("wait-child", "completed", { latestText: "waited result" }));
+		}, 60);
+		const waitDefaultResult = await waitDefault;
+		check(
+			"default check waits for the first finished result",
+			waitDefaultResult.content[0].text.includes("waited result") && Date.now() - waitChildStarted < 2000,
+			waitDefaultResult.content[0].text,
+		);
+
+		registry.saveRecord(checkAgentDir, checkRecord("snapshot-child", "thinking", { activity: "working" }));
+		const snapshotStarted = Date.now();
+		const snapshot = await checkTool.execute("snapshot", { wait: false }, undefined, undefined, {});
+		check(
+			"wait:false returns an immediate snapshot",
+			Date.now() - snapshotStarted < 300 && snapshot.content[0].text.includes("still running"),
+			snapshot.content[0].text,
+		);
+		registry.saveRecord(checkAgentDir, checkRecord("snapshot-child", "completed", { latestText: "snapshot result" }));
+		const snapshotClaim = await checkTool.execute("snapshot-claim", {}, undefined, undefined, {});
+		check("snapshot child stays collectable", snapshotClaim.content[0].text.includes("snapshot result"));
+
+		registry.saveRecord(checkAgentDir, checkRecord("timeout-child", "thinking", { activity: "working" }));
+		const timeoutStarted = Date.now();
+		const timedOut = await checkTool.execute("timeout", { timeoutMs: 150 }, undefined, undefined, {});
+		check(
+			"default check honors its timeout while work continues",
+			Date.now() - timeoutStarted >= 120 && timedOut.content[0].text.includes("still running") && timedOut.content[0].text.includes("none arrived"),
+			timedOut.content[0].text,
+		);
+		await checkTools.get("cancel_subagent").execute("cancel-timeout", { target: "timeout-child" }, undefined, undefined, {});
+		await checkTool.execute("timeout-claim", {}, undefined, undefined, {});
+		const idleCheckStarted = Date.now();
+		const idleCheck = await checkTool.execute("idle-check", {}, undefined, undefined, {});
+		check(
+			"terminal session check returns without waiting",
+			Date.now() - idleCheckStarted < 300 && idleCheck.content[0].text.includes("No new subagent results since the last check."),
+			idleCheck.content[0].text,
+		);
+
+		// A running grandchild cannot produce a claimable result for this session, so
+		// the default check returns immediately instead of waiting for it.
+		registry.saveRecord(checkAgentDir, mk("idle-desc", "owner-child", {
+			rootRunId: "check-parent", depth: 2, status: "thinking", activity: "working", executionId: "desc-exec",
+		}));
+		const descendantWaitStarted = Date.now();
+		const descendantWait = await checkTool.execute("descendant-wait", {}, undefined, undefined, {});
+		check(
+			"default check does not block on descendants",
+			Date.now() - descendantWaitStarted < 300 && descendantWait.content[0].text.includes("idle-desc"),
+			descendantWait.content[0].text,
+		);
 
 		// Repeated executions replace the unread snapshot rather than creating
 		// one queued prompt per completion.
@@ -545,6 +609,15 @@ function check(name, cond, extra) {
 		checkHandlers.get("agent_settled")();
 		await new Promise((r) => setTimeout(r, 50));
 		check("settling after acknowledgement does not replay reports", queuedReports.length === 1);
+
+		// A best-effort preview is not re-sent by the idle batch, but check still collects it.
+		registry.saveRecord(checkAgentDir, checkRecord("preview-batch", "completed", { latestText: "preview batch result", executionId: "pb1" }));
+		checkHandlers.get("tool_result")(toolEvent, {});
+		checkHandlers.get("agent_settled")();
+		await new Promise((r) => setTimeout(r, 50));
+		check("previewed result is not re-sent by the idle batch", !queuedReports.some((report) => report.message.content.includes("preview batch result")));
+		const previewCollected = await checkTool.execute("preview-collect", {}, undefined, undefined, {});
+		check("previewed result stays collectable by check", previewCollected.content[0].text.includes("preview batch result"));
 
 		registry.saveRecord(checkAgentDir, mk("owner-grand", "owner-child", {
 			rootRunId: "check-parent", depth: 2, status: "completed", latestText: "new grandchild execution", executionId: "new-execution",
@@ -570,7 +643,7 @@ function check(name, cond, extra) {
 		check("marker failure injection exercised", injectedMarkerFailures === 1);
 		check("partial marker failure preserves all reports", faultResult.content[1].text.includes("good marker report") && faultResult.content[1].text.includes("failed marker report"));
 		check("in-memory receipt prevents failed-marker replay", checkHandlers.get("tool_result")(toolEvent, {}) === undefined);
-		check("tool result contains durable delivery receipts", faultResult.details.resultKeys.length === 2);
+		check("tool result contains durable preview receipts", faultResult.details.previewResultKeys.length === 2);
 		await checkHandlers.get("session_shutdown")({}, { mode: "rpc" });
 		await checkHandlers.get("session_start")({}, {
 			sessionManager: {
@@ -580,7 +653,13 @@ function check(name, cond, extra) {
 			cwd: sandbox, isProjectTrusted: () => false, mode: "rpc", hasUI: false,
 		});
 		const restoredDirect = await checkTool.execute("restored-direct", {}, undefined, undefined, {});
-		check("reload restores delivery after marker failure", !restoredDirect.content[0].text.includes("failed marker report"));
+		check(
+			"reload keeps previewed reports collectable once",
+			restoredDirect.content[0].text.includes("failed marker report") && restoredDirect.content[0].text.includes("good marker report"),
+			restoredDirect.content[0].text,
+		);
+		const restoredAgain = await checkTool.execute("restored-direct-again", {}, undefined, undefined, {});
+		check("reload receipts prevent a repeat after collection", !restoredAgain.content[0].text.includes("failed marker report"));
 	} finally {
 		checkHandlers.get("session_shutdown")?.({}, { mode: "rpc" });
 		if (previousAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
@@ -658,6 +737,20 @@ function check(name, cond, extra) {
 	registry.saveRecord(agentDir2, mk("stale", "root", { status: "running_tool", pid: 2147483647 }));
 	const stale = registry.readRecords(agentDir2).find((r) => r.runId === "stale");
 	check("dead pid reconciled to failed", stale && stale.status === "failed", stale && stale.status);
+	if (process.platform === "linux") {
+		const identity = registry.readProcessIdentity(process.pid);
+		check("process identity exposes a start time", !!identity?.startTime);
+		registry.saveRecord(agentDir2, mk("live-pid", "root", { status: "thinking", pid: process.pid, pidStartTime: identity?.startTime }));
+		check(
+			"matching pid start time stays active",
+			registry.readRecords(agentDir2).find((r) => r.runId === "live-pid")?.status !== "failed",
+		);
+		registry.saveRecord(agentDir2, mk("recycled-pid", "root", { status: "thinking", pid: process.pid, pidStartTime: "0" }));
+		check(
+			"recycled pid promotes a stale run to failed",
+			registry.readRecords(agentDir2).find((r) => r.runId === "recycled-pid")?.status === "failed",
+		);
+	}
 
 	// --- events ---
 	const rec = mk("x", "root", { status: "starting", activity: "starting" });

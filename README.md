@@ -14,7 +14,8 @@ Recursive, isolated, asynchronous subagents for the [Pi coding agent](https://gi
 - **Live monitoring** — the footer shows a recursive status tree with provider/model, activity, and elapsed time.
 - **Interactive transcripts** — open any child to read its complete Pi session from the original delegation prompt, including messages and tool calls.
 - **Steering and follow-ups** — message a running child to redirect it, or message a finished child to continue its existing session.
-- **Automatic delivery** — finished results arrive with the next completed parent tool result. An idle parent receives one batch and resumes. `check_subagents` can collect pending results explicitly.
+- **Automatic delivery** — finished results are previewed on the next completed parent tool result. An idle parent receives one batch and resumes. `check_subagents` collects results that no earlier check returned.
+- **No polling required** — results arrive without asking. A check blocks only while a result can still arrive, so a call is never a wasted wait.
 - **Cancellation** — stop a running or queued child by run ID, session ID, or name.
 - **No added dependencies** — uses Pi's extension and TUI APIs plus Node.js built-ins.
 
@@ -96,13 +97,17 @@ Thinking level follows the same precedence and is clamped to the selected child 
 
 ### `check_subagents`
 
-Inspect descendants and collect newly finished results without repeating results already delivered. Each ancestor sees a descendant execution once, without claiming the direct parent's result. Use `wait: true` before relying on work that is still running:
+Collect finished results that no previous check has returned. Each ancestor sees a descendant execution once, without claiming the direct parent's result.
 
 ```text
 check_subagents({ wait: true, timeoutMs: 120000 })
 ```
 
-`timeoutMs` defaults to 30 seconds and is capped at 300 seconds. The wait returns as soon as every descendant finishes; the timeout is only a maximum.
+Automatic delivery is best-effort; a check is authoritative. A result that only appeared as a tool-output preview is still returned by the next check, while results already returned by an earlier check are not repeated. This means a check never hides a finished result just because it was delivered automatically.
+
+A default check never waits pointlessly. It returns immediately when every subagent is terminal or nothing new is pending. While subagents are running, it waits for the first finished result (or until they all finish) up to `timeoutMs`, so the call returns with something useful instead of an empty status. Pass `wait: false` for an immediate status snapshot, or `wait: true` to block until every subagent finishes. `timeoutMs` defaults to 30 seconds and is capped at 300 seconds.
+
+Results are also delivered automatically, so repeated checks just to poll status waste turns. Call `check_subagents` when you need results now, then continue with other work.
 
 ### `send_to_subagent`
 
@@ -122,7 +127,9 @@ cancel_subagent({ target: "auth-reviewer" })
 
 ## Result delivery
 
-While the parent works, finished child reports stay in the registry until a completed parent tool result or `check_subagents` consumes them. Automatic delivery appends reports to the tool output without steering the parent or skipping sibling tool calls. If the parent becomes idle first, it receives the pending reports in one message that starts a new turn.
+While the parent works, finished child reports stay in the registry until a completed parent tool result previews them, an idle batch delivers them, or `check_subagents` collects them. Automatic delivery appends reports to the tool output without steering the parent or skipping sibling tool calls. If the parent becomes idle first, it receives the pending reports in one message that starts a new turn.
+
+A tool-output append is a best-effort preview. It stops the same report from being appended again, but the report remains collectable by `check_subagents` until a check returns it or an idle batch delivers it. This keeps the model from losing a result that was buried in unrelated tool output while still avoiding duplicate automatic deliveries.
 
 This replaces the previous behavior of queueing a separate follow-up prompt for every completion. Reports no longer accumulate behind a long parent run and replay after its final answer. If a child completes several follow-ups before the parent consumes its report, only the latest execution is delivered. Earlier output remains available in the child's transcript.
 

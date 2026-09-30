@@ -79,7 +79,7 @@ function readCancellationMarker(agentDir: string, runId: string): CancellationMa
 	return { version: 1, runId, cancelledAt: new Date().toISOString(), error: "Cancelled" };
 }
 
-type ResultStateFlag = "resultsDelivered" | "footerDismissed";
+type ResultStateFlag = "resultsDelivered" | "resultsPreviewed" | "footerDismissed";
 
 function resultStatePath(agentDir: string, record: AgentRecord, flag: ResultStateFlag): string {
 	return join(registryDir(agentDir), `${safeRunId(record.runId)}.${safeRunId(record.executionId ?? "legacy")}.${flag}`);
@@ -97,7 +97,7 @@ export function markRecordResultState(agentDir: string, record: AgentRecord, fla
 
 function applyMarkers(agentDir: string, record: AgentRecord): AgentRecord {
 	let result = record;
-	for (const flag of ["resultsDelivered", "footerDismissed"] as const) {
+	for (const flag of ["resultsDelivered", "resultsPreviewed", "footerDismissed"] as const) {
 		if (existsSync(resultStatePath(agentDir, record, flag))) result = { ...result, [flag]: true };
 	}
 	const cancellation = readCancellationMarker(agentDir, record.runId);
@@ -243,6 +243,42 @@ export function isProcessAlive(pid: number | undefined): boolean {
 	}
 }
 
+export interface ProcessIdentity {
+	pid: number;
+	processGroup: number;
+	/** Linux /proc start time, used to reject PID reuse. */
+	startTime: string;
+}
+
+/** Read a live process identity on Linux; undefined elsewhere or when /proc is unavailable. */
+export function readProcessIdentity(pid: number): ProcessIdentity | undefined {
+	if (process.platform !== "linux") return undefined;
+	try {
+		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close < 0) return undefined;
+		const fields = stat.slice(close + 2).trim().split(/\s+/);
+		const processGroup = Number(fields[2]);
+		const startTime = fields[19];
+		if (!Number.isInteger(processGroup) || !startTime) return undefined;
+		return { pid, processGroup, startTime };
+	} catch {
+		return undefined;
+	}
+}
+
+/**
+ * A recorded PID is only alive when the process still exists and, when a start
+ * time was recorded, still refers to the same process. Without the start-time
+ * check a recycled PID would keep a dead run looking active forever.
+ */
+function isRecordedProcessAlive(record: AgentRecord): boolean {
+	if (!record.pid || !isProcessAlive(record.pid)) return false;
+	if (!record.pidStartTime) return true;
+	const identity = readProcessIdentity(record.pid);
+	return !identity || identity.startTime === record.pidStartTime;
+}
+
 export function readRecords(agentDir: string): AgentRecord[] {
 	const dir = registryDir(agentDir);
 	if (!existsSync(dir)) return [];
@@ -253,7 +289,7 @@ export function readRecords(agentDir: string): AgentRecord[] {
 			const value: unknown = JSON.parse(readFileSync(join(dir, name), "utf8"));
 			if (!isRecord(value)) continue;
 			const marked = applyMarkers(agentDir, value);
-			if (!TERMINAL.has(marked.status) && marked.pid && !isProcessAlive(marked.pid)) {
+			if (!TERMINAL.has(marked.status) && marked.pid && !isRecordedProcessAlive(marked)) {
 				records.push({
 					...marked,
 					status: "failed",

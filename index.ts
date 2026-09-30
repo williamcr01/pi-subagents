@@ -14,7 +14,7 @@ import { currentDepth, loadSettings, THINKING_LEVEL_VALUES } from "./config.ts";
 import { requestOwnerMessage, startOwnerMessageConsumer } from "./owner-control.ts";
 import { SubagentPanel } from "./panel.ts";
 import { isProcessAlive, isTerminalStatus, markRecordResultState, readRecords } from "./registry.ts";
-import { notifyWaiters, waitUntilSubagentsIdle } from "./wait.ts";
+import { notifyWaiters, waitForSubagentResult, waitUntilSubagentsIdle } from "./wait.ts";
 import {
 	cancelSubagent,
 	killPidTree,
@@ -82,8 +82,8 @@ const SpawnAgentSchema = Type.Object({
 });
 
 const CheckSchema = Type.Object({
-	wait: Type.Optional(Type.Boolean({ description: "Block until every subagent finishes; returns as soon as they all finish or the timeout elapses" })),
-	timeoutMs: Type.Optional(Type.Integer({ description: "Max wait in ms when wait:true (default 30000, max 300000). Returns sooner if every descendant finishes." })),
+	wait: Type.Optional(Type.Boolean({ description: "false returns an immediate status snapshot; true blocks until every subagent finishes; omit to wait for the first result while subagents are running" })),
+	timeoutMs: Type.Optional(Type.Integer({ description: "Max wait in ms (default 30000, max 300000). Returns sooner when a result is ready or every descendant finishes." })),
 });
 
 const CancelSchema = Type.Object({
@@ -110,6 +110,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let panel: SubagentPanel | undefined;
 	let mainModel: string | undefined;
 	let deliveryTimer: ReturnType<typeof setTimeout> | undefined;
+	let deliveryDueAt = 0;
 	let deliveryRetryDelay = 1000;
 	let keepAlive: ReturnType<typeof setInterval> | undefined;
 	let stopOwnerConsumer: (() => Promise<void>) | undefined;
@@ -121,6 +122,8 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	let deliveryPaused = false;
 	let activeSignal: AbortSignal | undefined;
 	const deliveredResults = new Set<string>();
+	/** Best-effort tool-result appends; unlike delivery, a preview stays collectable by check. */
+	const previewedResults = new Set<string>();
 	const seenDescendantResults = new Set<string>();
 	const resultKey = (record: AgentRecord) => JSON.stringify([
 		record.runId, record.executionId ?? record.finishedAt ?? record.updatedAt,
@@ -134,14 +137,25 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 			}
 		}
 	};
+	const rememberPreviewed = (records: AgentRecord[]) => {
+		for (const record of records) {
+			previewedResults.add(resultKey(record));
+			try { markRecordResultState(getAgentDir(), record, "resultsPreviewed"); } catch {
+				// A failed preview marker only risks repeating the append; check still returns the result.
+			}
+		}
+	};
 	const restoreReceipts = (entries: readonly SessionEntry[]) => {
 		seenDescendantResults.clear();
 		for (const entry of entries) {
 			const rawDetails = entry.type === "custom_message" && entry.customType === "subagent-results"
 				? entry.details : entry.type === "message" && entry.message.role === "toolResult" ? entry.message.details : undefined;
-			const details = rawDetails as { resultKeys?: unknown; seenDescendantResults?: unknown } | undefined;
+			const details = rawDetails as { resultKeys?: unknown; previewResultKeys?: unknown; seenDescendantResults?: unknown } | undefined;
 			for (const key of Array.isArray(details?.resultKeys) ? details.resultKeys : []) {
 				if (typeof key === "string") deliveredResults.add(key);
+			}
+			for (const key of Array.isArray(details?.previewResultKeys) ? details.previewResultKeys : []) {
+				if (typeof key === "string") previewedResults.add(key);
 			}
 			for (const key of Array.isArray(details?.seenDescendantResults) ? details.seenDescendantResults : []) {
 				if (typeof key === "string") seenDescendantResults.add(key);
@@ -170,9 +184,16 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 
 	/** Deliver finished-but-undelivered child results to this session, debounced so parallel finishes batch into one message. */
 	const scheduleDelivery = (delay = 1000) => {
-		if (deliveryTimer || shuttingDown) return;
+		if (shuttingDown) return;
+		const dueAt = Date.now() + delay;
+		// A sooner request (for example agent_settled asking for 0ms) must not be
+		// delayed behind a pending debounce from a child completion.
+		if (deliveryTimer && dueAt >= deliveryDueAt) return;
+		if (deliveryTimer) clearTimeout(deliveryTimer);
+		deliveryDueAt = dueAt;
 		deliveryTimer = setTimeout(async () => {
 			deliveryTimer = undefined;
+			deliveryDueAt = 0;
 			try {
 				await deliverResults();
 				deliveryRetryDelay = 1000;
@@ -194,7 +215,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		if (!runtime || shuttingDown || delivering || deliveryPaused || agentActive || isIdle?.() === false) return;
 		const agentDir = getAgentDir();
 		const children = readRecords(agentDir).filter((record) => record.parentRunId === runtime!.runId);
-		const pending = children.filter((record) => isTerminalStatus(record.status) && !record.resultsDelivered && !deliveredResults.has(resultKey(record)));
+		const pending = children.filter(
+			(record) =>
+				isTerminalStatus(record.status) &&
+				!record.resultsDelivered &&
+				!record.resultsPreviewed &&
+				!deliveredResults.has(resultKey(record)) &&
+				!previewedResults.has(resultKey(record)),
+		);
 		if (pending.length === 0) return;
 		const stillRunning = children.filter((record) => !isTerminalStatus(record.status)).length;
 		const parts = pending.map((record) => {
@@ -247,26 +275,34 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 	// Attach fresh results to a completed tool, rather than queueing a separate
 	// prompt. Pi persists this content and includes it in the next model call.
 	// This does not steer the agent or skip any sibling tool calls.
+	// It is a best-effort preview: it suppresses further appends but does not
+	// claim delivery, so an explicit check can still return the result.
 	pi.on("tool_result", (event, ctx) => {
 		if (ctx.signal?.aborted) { deliveryPaused = true; return; }
 		if (!runtime || shuttingDown || delivering || deliveryPaused) return;
 		// Custom tools may use scalar/array details. Leave their result shape alone.
 		if (event.details !== undefined && (!event.details || typeof event.details !== "object" || Array.isArray(event.details))) return;
 		const details = event.details as Record<string, unknown> | undefined;
-		const previousKeys = Array.isArray(details?.resultKeys) ? details.resultKeys : [];
+		const previousKeys = Array.isArray(details?.previewResultKeys) ? details.previewResultKeys : [];
 		const agentDir = getAgentDir();
 		const pending = readRecords(agentDir).filter(
-			(record) => record.parentRunId === runtime!.runId && isTerminalStatus(record.status) && !record.resultsDelivered && !deliveredResults.has(resultKey(record)),
+			(record) =>
+				record.parentRunId === runtime!.runId &&
+				isTerminalStatus(record.status) &&
+				!record.resultsDelivered &&
+				!record.resultsPreviewed &&
+				!deliveredResults.has(resultKey(record)) &&
+				!previewedResults.has(resultKey(record)),
 		);
 		if (pending.length === 0) return;
 		const text = pending.map((record) => {
 			const body = record.status === "completed" ? record.latestText || "(no output)" : record.error || record.status;
 			return `### ${record.name} — ${record.status}\n\n${cap(body, RESULT_OUTPUT_CAP)}`;
 		}).join("\n\n");
-		rememberDelivered(pending);
+		rememberPreviewed(pending);
 		return {
-			content: [...event.content, { type: "text" as const, text: `Subagent results:\n\n${text}` }],
-			details: { ...details, resultKeys: [...previousKeys, ...pending.map(resultKey)] },
+			content: [...event.content, { type: "text" as const, text: `Subagent results (preview; collect with check_subagents if needed):\n\n${text}` }],
+			details: { ...details, previewResultKeys: [...previousKeys, ...pending.map(resultKey)] },
 		};
 	});
 
@@ -281,6 +317,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		isIdle = () => ctx.isIdle?.() ?? !agentActive;
 		deliveryPaused = false;
 		deliveredResults.clear();
+		previewedResults.clear();
 		restoreReceipts(ctx.sessionManager.getBranch?.() ?? []);
 		const runId = process.env.PI_SUBAGENT_RUN_ID || ctx.sessionManager.getSessionId();
 		const rootRunId = process.env.PI_SUBAGENT_ROOT_ID || runId;
@@ -424,6 +461,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		if (deliveryTimer) {
 			clearTimeout(deliveryTimer);
 			deliveryTimer = undefined;
+			deliveryDueAt = 0;
 		}
 		if (keepAlive) {
 			clearInterval(keepAlive);
@@ -464,10 +502,11 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "spawn_agent",
 		label: "Spawn Agent",
 		description:
-			"Spawn an isolated recursive Pi subagent that runs in the background and returns immediately. Omit model to use subagents.json defaultModel, or inherit the creating agent's active model. Omit tools to inherit the creating session's active tools; an explicit list may only remove tools. The child keeps running while you do other work; collect results with check_subagents. Finished results also arrive with the next completed tool result, or automatically when you go idle.",
+			"Spawn an isolated recursive Pi subagent that runs in the background and returns immediately. Omit model to use subagents.json defaultModel, or inherit the creating agent's active model. Omit tools to inherit the creating session's active tools; an explicit list may only remove tools. The child keeps running while you do other work. Finished results arrive automatically as a tool-output preview or one idle batch; call check_subagents only when you need them now.",
 		promptSnippet: "Delegate focused independent work to an isolated recursive subagent running in the background",
 		promptGuidelines: [
 			"spawn_agent returns immediately; the child keeps running while you continue other work.",
+			"Do not poll check_subagents in a loop; finished results are delivered automatically.",
 			"Call check_subagents with wait:true before your final answer whenever spawned results matter, and use cancel_subagent to stop a runaway child.",
 		],
 		parameters: SpawnAgentSchema,
@@ -527,7 +566,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				content: [
 					{
 						type: "text",
-						text: `Spawned subagent "${record.name}" (run ${shortId(record.runId)}, depth ${record.depth}/${record.maxDepth}, model ${record.model}). It is ${record.status === "queued" ? "queued" : "running in the background"} — continue with other work and call check_subagents (wait:true) to collect its result.`,
+						text: `Spawned subagent "${record.name}" (run ${shortId(record.runId)}, depth ${record.depth}/${record.maxDepth}, model ${record.model}). It is ${record.status === "queued" ? "queued" : "running in the background"} — continue with other work. Its result arrives automatically with your next completed tool result or when you go idle; call check_subagents (wait:true) only when you need results before that.`,
 					},
 				],
 				details: { record },
@@ -556,37 +595,73 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		name: "check_subagents",
 		label: "Check Subagents",
 		description:
-			"Check the status of this session's subagents and collect newly finished results without repeating ones already delivered. Use wait:true to block until they all finish; the call returns as soon as they do, and timeoutMs is only a maximum.",
+			"Check this session's subagents and collect finished results that no previous check has returned. Results that only arrived as a tool-output preview stay collectable; results from an earlier check are not repeated. If subagents are running, the default call waits for the first new result (or until all finish) up to timeoutMs (default 30000, max 300000). wait:false returns an immediate status snapshot; wait:true blocks until every subagent finishes.",
 		promptSnippet: "Check or wait for background subagent results",
+		promptGuidelines: [
+			"Do not poll check_subagents in a loop; finished results also arrive automatically with the next completed tool result or one idle batch.",
+			"Call check_subagents once, with wait:true if needed, before relying on spawned results.",
+		],
 		parameters: CheckSchema,
 		async execute(_toolCallId, params, signal, _onUpdate, ctx) {
 			if (!runtime) throw new Error("Subagent extension settings failed to initialize");
 			const agentDir = getAgentDir();
 			const snapshot = () => descendantsOf(readRecords(agentDir), runtime!.runId);
-			if (params.wait) {
-				const timeoutMs = Math.min(Math.max(params.timeoutMs ?? 30000, 0), 300000);
+			const hasFresh = (rows: readonly AgentRecord[]) =>
+				rows.some(
+					(record) =>
+						record.parentRunId === runtime!.runId &&
+						isTerminalStatus(record.status) &&
+						!record.resultsDelivered &&
+						!deliveredResults.has(resultKey(record)),
+				);
+			const timeoutMs = Math.min(Math.max(params.timeoutMs ?? 30000, 0), 300000);
+			let waitedMs = 0;
+			if (params.wait === true) {
+				const started = Date.now();
 				await waitUntilSubagentsIdle(agentDir, runtime.runId, { timeoutMs, signal });
+				waitedMs = Date.now() - started;
+			} else if (params.wait !== false) {
+				// Waiting is only useful while a direct child can still produce a
+				// claimable result. Terminal sessions and descendant-only trees return
+				// the snapshot without blocking.
+				const initial = snapshot();
+				const runningChild = initial.some(
+					(record) => record.parentRunId === runtime!.runId && !isTerminalStatus(record.status),
+				);
+				if (!hasFresh(initial) && runningChild) {
+					const started = Date.now();
+					await waitForSubagentResult(agentDir, runtime.runId, {
+						timeoutMs,
+						signal,
+						isReady: hasFresh,
+					});
+					waitedMs = Date.now() - started;
+				}
 			}
-			// Refresh before claiming results so auto-delivery that happened while
-			// waiting is not repeated by this check.
+			// Refresh before claiming results so authoritative delivery that happened
+			// while waiting is not repeated by this check.
 			const rows = snapshot();
 			// This session owns delivery only for its direct children. Descendant
 			// results remain visible, but their direct parent must claim them.
-			const newlyFinished = rows.filter(
-				(record) => record.parentRunId === runtime!.runId && isTerminalStatus(record.status) && !record.resultsDelivered && !deliveredResults.has(resultKey(record)),
+			const newlyCollected = rows.filter(
+				(record) =>
+					record.parentRunId === runtime!.runId &&
+					isTerminalStatus(record.status) &&
+					!record.resultsDelivered &&
+					!deliveredResults.has(resultKey(record)),
 			);
-			rememberDelivered(newlyFinished);
+			rememberDelivered(newlyCollected);
 			if (rows.length === 0) {
 				return { content: [{ type: "text", text: "No subagents have been spawned by this session." }], details: { records: [] } };
 			}
 			const running = rows.filter((record) => !isTerminalStatus(record.status));
-			const newlyFinishedIds = new Set(newlyFinished.map((record) => record.runId));
+			const newlyCollectedIds = new Set(newlyCollected.map((record) => record.runId));
 			const observedDescendants: string[] = [];
 			const sections = rows
 				.filter(
 					(record) =>
 						!isTerminalStatus(record.status) ||
-						newlyFinishedIds.has(record.runId) ||
+						newlyCollectedIds.has(record.runId) ||
 						(record.parentRunId !== runtime!.runId && !record.resultsDelivered && !seenDescendantResults.has(resultKey(record))),
 				)
 				.map((record) => {
@@ -612,10 +687,14 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				running.length > 0
 					? `${rows.length - running.length}/${rows.length} finished, ${running.length} still running.`
 					: `All ${rows.length} subagent${rows.length === 1 ? "" : "s"} finished.`;
+			const waitedNote =
+				waitedMs > 0 && newlyCollected.length === 0
+					? `\n\nWaited ${Math.max(1, Math.round(waitedMs / 1000))}s for a new result; none arrived.`
+					: "";
 			const sectionText = sections.length > 0 ? sections.join("\n\n") : "No new subagent results since the last check.";
 			return {
-				content: [{ type: "text", text: `${summary}\n\n${sectionText}` }],
-				details: { records: rows, resultKeys: newlyFinished.map(resultKey), seenDescendantResults: observedDescendants },
+				content: [{ type: "text", text: `${summary}${waitedNote}\n\n${sectionText}` }],
+				details: { records: rows, resultKeys: newlyCollected.map(resultKey), seenDescendantResults: observedDescendants },
 			};
 		},
 	});

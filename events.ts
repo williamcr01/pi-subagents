@@ -60,6 +60,7 @@ export function applyChildEvent(record: AgentRecord, state: ParsedChildState, ev
 			record.error = undefined;
 			record.finishedAt = undefined;
 			record.resultsDelivered = false;
+			record.resultsPreviewed = false;
 			record.footerDismissed = false;
 			important = true;
 			break;

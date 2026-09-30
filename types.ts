@@ -40,8 +40,14 @@ export interface AgentRecord {
 	executionId?: string;
 	/** Set when the user started a newer turn: hide from the footer tree. History stays reviewable. */
 	footerDismissed?: boolean;
-	/** Set once this child's result has been delivered to the parent session. */
+	/**
+	 * Set once this child's result reached the parent through an authoritative
+	 * delivery (idle batch or an explicit check). Auto-appends to tool output set
+	 * resultsPreviewed instead: they are best-effort and stay collectable by check.
+	 */
 	resultsDelivered?: boolean;
+	/** Set after this child's result was appended to a parent tool result. */
+	resultsPreviewed?: boolean;
 	activity?: string;
 	currentTool?: string;
 	latestText?: string;

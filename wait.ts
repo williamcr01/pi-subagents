@@ -13,6 +13,11 @@ export interface WaitUntilIdleOptions {
 	pollMs?: number;
 }
 
+export interface WaitForResultOptions extends WaitUntilIdleOptions {
+	/** Called with a fresh snapshot; return true when the caller has something new to report. */
+	isReady: (rows: readonly AgentRecord[]) => boolean;
+}
+
 interface Waiter {
 	agentDir: string;
 	wake: () => void;
@@ -127,11 +132,33 @@ export async function waitUntilSubagentsIdle(
 	parentRunId: string,
 	options: WaitUntilIdleOptions,
 ): Promise<AgentRecord[]> {
+	return waitForDescendants(agentDir, parentRunId, options, isIdle);
+}
+
+/**
+ * Block until the caller has a fresh result, every descendant is terminal,
+ * `timeoutMs` elapses, or `signal` aborts. This lets an explicit check wait for
+ * the first finished report instead of returning a useless status snapshot.
+ */
+export async function waitForSubagentResult(
+	agentDir: string,
+	parentRunId: string,
+	options: WaitForResultOptions,
+): Promise<AgentRecord[]> {
+	return waitForDescendants(agentDir, parentRunId, options, (rows) => isIdle(rows) || options.isReady(rows));
+}
+
+async function waitForDescendants(
+	agentDir: string,
+	parentRunId: string,
+	options: WaitUntilIdleOptions,
+	isDone: (rows: readonly AgentRecord[]) => boolean,
+): Promise<AgentRecord[]> {
 	const timeoutMs = options.timeoutMs;
 	const pollMs = options.pollMs ?? DEFAULT_POLL_MS;
 	const snapshot = () => snapshotDescendants(agentDir, parentRunId);
 	let rows = snapshot();
-	if (isIdle(rows) || timeoutMs <= 0) return rows;
+	if (isDone(rows) || timeoutMs <= 0) return rows;
 	if (options.signal?.aborted) throw new Error("check_subagents was aborted");
 
 	return new Promise<AgentRecord[]>((resolveWait, rejectWait) => {
@@ -159,7 +186,7 @@ export async function waitUntilSubagentsIdle(
 			agentDir: key,
 			wake() {
 				try {
-					if (isIdle(snapshot())) finish();
+					if (isDone(snapshot())) finish();
 				} catch {
 					// Keep waiting until timeout; a transient read must not fail the tool.
 				}

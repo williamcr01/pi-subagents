@@ -1,6 +1,6 @@
 import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
 import { basename, isAbsolute, join, relative, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
@@ -12,6 +12,8 @@ import {
 	isProcessAlive,
 	isRecordCancelled,
 	isTerminalStatus,
+	readProcessIdentity,
+	type ProcessIdentity,
 	readRecords,
 	saveRecord,
 	withRecordLock,
@@ -255,28 +257,6 @@ function ensureDirectory(value: string): string {
 export function isWithinDirectory(path: string, directory: string): boolean {
 	const child = relative(directory, path);
 	return child === "" || (!isAbsolute(child) && child !== ".." && !child.startsWith(`..${process.platform === "win32" ? "\\" : "/"}`));
-}
-
-interface ProcessIdentity {
-	pid: number;
-	startTime: string;
-	processGroup: number;
-}
-
-function readProcessIdentity(pid: number): ProcessIdentity | undefined {
-	if (process.platform !== "linux") return undefined;
-	try {
-		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
-		const close = stat.lastIndexOf(")");
-		if (close < 0) return undefined;
-		const fields = stat.slice(close + 2).trim().split(/\s+/);
-		const processGroup = Number(fields[2]);
-		const startTime = fields[19];
-		if (!Number.isInteger(processGroup) || !startTime) return undefined;
-		return { pid, processGroup, startTime };
-	} catch {
-		return undefined;
-	}
 }
 
 function sameProcess(identity: ProcessIdentity): boolean {
