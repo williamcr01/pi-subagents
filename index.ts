@@ -19,6 +19,7 @@ import {
 	cancelSubagent,
 	killPidTree,
 	sendSubagentMessage,
+	settleExternalKills,
 	startSubagent,
 	terminateOwnedSubagents,
 } from "./spawn-agent.ts";
@@ -366,8 +367,13 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 					panel = new SubagentPanel(tui, theme, getAgentDir(), runtime!.runId, {
 						onMessage: async (record, text) => sendToRecord(record, text),
 						onCancel: (record) => {
-							const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
-							if (!isTerminalStatus(latest.status)) trackChild(cancelSubagent(getAgentDir(), latest));
+							try {
+								const latest = readRecords(getAgentDir()).find((item) => item.runId === record.runId) ?? record;
+								if (!isTerminalStatus(latest.status)) trackChild(cancelSubagent(getAgentDir(), latest));
+							} catch {
+								// This key is delivered on stdin. A lock timeout or a rename
+								// EPERM would otherwise exit Pi before session_shutdown.
+							}
 						},
 					});
 					if (editor) panel.setEditor(editor);
@@ -477,7 +483,7 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 		for (const record of records.slice().reverse()) {
 			try {
 				if (isTerminalStatus(record.status)) {
-					if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid, record.pidStartTime);
+					if (record.pid && isProcessAlive(record.pid)) await killPidTree(record.pid, record.pidStartTime);
 				} else {
 					cancelSubagent(agentDir, record);
 				}
@@ -485,7 +491,12 @@ export default function subagentsExtension(pi: ExtensionAPI) {
 				// Cross-process cleanup is best effort. Owned children are awaited below.
 			}
 		}
-		await terminateOwnedSubagents(records.map((record) => record.runId));
+		try {
+			await settleExternalKills();
+			await terminateOwnedSubagents(records.map((record) => record.runId));
+		} catch {
+			// A failed taskkill must not take down the exiting session.
+		}
 		await consumerStopped;
 	});
 

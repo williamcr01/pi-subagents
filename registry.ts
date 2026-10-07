@@ -1,3 +1,4 @@
+import { execFile, execFileSync } from "node:child_process";
 import {
 	existsSync,
 	mkdirSync,
@@ -14,6 +15,19 @@ import type { AgentRecord, AgentStatus } from "./types.ts";
 const TERMINAL = new Set<AgentStatus>(["completed", "failed", "cancelled"]);
 const LOCK_STALE_MS = 30_000;
 const LOCK_WAIT_MS = 5_000;
+const REPLACE_ATTEMPTS = 8;
+const TRANSIENT_FS_CODES = new Set(["EPERM", "EACCES", "EBUSY"]);
+const WINDOWS_IDENTITY_FRESH_MS = 1_000;
+const WINDOWS_PROBE_BACKOFF_MS = 2_000;
+
+interface CachedWindowsStart {
+	startTime: string;
+	fetchedAt: number;
+}
+
+const windowsStartTimeCache = new Map<number, CachedWindowsStart>();
+const windowsProbeFailures = new Map<number, number>();
+const windowsProbeInflight = new Set<number>();
 
 interface CancellationMarker {
 	version: 1;
@@ -42,11 +56,37 @@ function markerPath(agentDir: string, runId: string, kind: "cancelled" | "closed
 	return join(registryDir(agentDir), `${safeRunId(runId)}.${kind}`);
 }
 
+function sleepSync(ms: number): void {
+	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
+}
+
+/** Windows MoveFileEx fails with EPERM while Defender or an indexer holds the destination. */
+export function isTransientFsError(error: unknown): boolean {
+	const code = (error as NodeJS.ErrnoException | undefined)?.code;
+	return !!code && TRANSIENT_FS_CODES.has(code);
+}
+
+/** Replace `to` with `from`. Retries the lock errors that kill a POSIX rename on Windows. */
+export function renameReplacing(from: string, to: string): void {
+	for (let attempt = 0; attempt < REPLACE_ATTEMPTS; attempt++) {
+		try {
+			renameSync(from, to);
+			return;
+		} catch (error) {
+			if (!isTransientFsError(error) || attempt === REPLACE_ATTEMPTS - 1) throw error;
+			sleepSync(15 * (attempt + 1));
+		}
+	}
+}
+
 function atomicWrite(target: string, contents: string): void {
 	const temporary = `${target}.tmp-${process.pid}-${Date.now()}-${Math.random().toString(16).slice(2)}`;
-	writeFileSync(temporary, contents, { encoding: "utf8", mode: 0o600 });
+	// mode is a chmod on Windows and can itself fail with EPERM. The directory is already private.
+	const options: { encoding: "utf8"; mode?: number } = { encoding: "utf8" };
+	if (process.platform !== "win32") options.mode = 0o600;
+	writeFileSync(temporary, contents, options);
 	try {
-		renameSync(temporary, target);
+		renameReplacing(temporary, target);
 	} catch (error) {
 		rmSync(temporary, { force: true });
 		throw error;
@@ -149,10 +189,6 @@ export function isRecordCancelled(agentDir: string, runId: string): boolean {
 	return existsSync(markerPath(agentDir, runId, "cancelled"));
 }
 
-function sleepSync(ms: number): void {
-	Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, ms);
-}
-
 function randomToken(): string {
 	return `${Date.now()}-${Math.random().toString(16).slice(2)}`;
 }
@@ -190,7 +226,7 @@ export function withRecordLock<T>(agentDir: string, runId: string, operation: ()
 			if (stale) {
 				const quarantine = `${lock}.stale-${process.pid}-${randomToken()}`;
 				try {
-					renameSync(lock, quarantine);
+					renameReplacing(lock, quarantine);
 					rmSync(quarantine, { recursive: true, force: true });
 				} catch {
 					// Another contender replaced or removed the stale lock.
@@ -246,12 +282,160 @@ export function isProcessAlive(pid: number | undefined): boolean {
 export interface ProcessIdentity {
 	pid: number;
 	processGroup: number;
-	/** Linux /proc start time, used to reject PID reuse. */
+	/** Linux /proc start ticks, or Windows creation time in Unix milliseconds. */
 	startTime: string;
 }
 
-/** Read a live process identity on Linux; undefined elsewhere or when /proc is unavailable. */
-export function readProcessIdentity(pid: number): ProcessIdentity | undefined {
+function windowsIdentityArgs(pid: number): string[] {
+	return [
+		"-NoProfile",
+		"-NonInteractive",
+		"-Command",
+		`[DateTimeOffset]::new((Get-Process -Id ${pid} -ErrorAction Stop).StartTime.ToUniversalTime()).ToUnixTimeMilliseconds()`,
+	];
+}
+
+function parseWindowsStartTime(raw: string): string | undefined {
+	const output = raw.replace(/^\uFEFF/, "").trim().split(/\r?\n/).at(-1) ?? "";
+	return /^\d+$/.test(output) ? output : undefined;
+}
+
+function queryWindowsStartTime(pid: number): string | undefined {
+	if (!Number.isInteger(pid) || pid < 1) return undefined;
+	try {
+		const raw = execFileSync("powershell.exe", windowsIdentityArgs(pid), {
+			windowsHide: true, encoding: "utf8", timeout: 2000, stdio: ["ignore", "pipe", "pipe"],
+		});
+		return parseWindowsStartTime(String(raw));
+	} catch {
+		return undefined;
+	}
+}
+
+function forgetWindowsProcess(pid: number): void {
+	windowsStartTimeCache.delete(pid);
+	windowsProbeFailures.delete(pid);
+}
+
+function rememberWindowsStartTime(pid: number, startTime: string | undefined): void {
+	if (!isProcessAlive(pid)) {
+		forgetWindowsProcess(pid);
+		return;
+	}
+	if (!startTime) {
+		windowsProbeFailures.set(pid, Date.now());
+		windowsStartTimeCache.delete(pid);
+		return;
+	}
+	windowsProbeFailures.delete(pid);
+	windowsStartTimeCache.set(pid, { startTime, fetchedAt: Date.now() });
+}
+
+/**
+ * Ask PowerShell off the caller stack. A failed probe is not filled from the cache.
+ * A sample that finishes after this pid died, or after a newer sample was stored,
+ * is dropped: the pid may already belong to another process.
+ */
+export function probeWindowsStartTime(pid: number): Promise<string | undefined> {
+	if (!Number.isInteger(pid) || pid < 1) return Promise.resolve(undefined);
+	if (!isProcessAlive(pid)) {
+		forgetWindowsProcess(pid);
+		return Promise.resolve(undefined);
+	}
+	return new Promise((resolve) => {
+		const startedAt = Date.now();
+		let sawDeath = false;
+		const watch = setInterval(() => {
+			if (!isProcessAlive(pid)) sawDeath = true;
+		}, 20);
+		watch.unref();
+		const finish = (startTime: string | undefined) => {
+			clearInterval(watch);
+			const cached = windowsStartTimeCache.get(pid);
+			const newer = !!cached && cached.fetchedAt >= startedAt;
+			if (sawDeath || !isProcessAlive(pid)) {
+				if (!newer) {
+					windowsStartTimeCache.delete(pid);
+					windowsProbeFailures.delete(pid);
+				}
+				// That sample belongs to a process that has exited. Returning it would
+				// make a reused pid look like the process a kill is allowed to stop.
+				resolve(undefined);
+				return;
+			}
+			if (newer) {
+				resolve(cached!.startTime);
+				return;
+			}
+			rememberWindowsStartTime(pid, startTime);
+			// The pid can die inside remember. Publish only the sample it kept.
+			resolve(windowsStartTimeCache.get(pid)?.startTime);
+		};
+		try {
+			execFile("powershell.exe", windowsIdentityArgs(pid), {
+				windowsHide: true, encoding: "utf8", timeout: 2000,
+			}, (error, stdout) => {
+				const startTime = error ? undefined : parseWindowsStartTime(String(stdout ?? ""));
+				finish(startTime);
+			});
+		} catch {
+			clearInterval(watch);
+			resolve(undefined);
+		}
+	});
+}
+
+function refreshProcessIdentitySoon(pid: number): void {
+	if (windowsProbeInflight.has(pid)) return;
+	const failedAt = windowsProbeFailures.get(pid);
+	if (failedAt !== undefined && Date.now() - failedAt < WINDOWS_PROBE_BACKOFF_MS) return;
+	const cached = windowsStartTimeCache.get(pid);
+	if (cached && Date.now() - cached.fetchedAt < WINDOWS_IDENTITY_FRESH_MS) return;
+	windowsProbeInflight.add(pid);
+	void probeWindowsStartTime(pid).finally(() => {
+		windowsProbeInflight.delete(pid);
+	});
+}
+
+function readWindowsProcessIdentity(pid: number, refresh: boolean): ProcessIdentity | undefined {
+	if (!Number.isInteger(pid) || pid < 1) return undefined;
+	if (!isProcessAlive(pid)) {
+		forgetWindowsProcess(pid);
+		return undefined;
+	}
+	const queried = (): ProcessIdentity | undefined => {
+		const startTime = queryWindowsStartTime(pid);
+		// A blocking query cannot see a reuse that finishes before this check: the
+		// event loop is stalled. Callers that store a start time for a later kill
+		// use probeWindowsStartTime, whose death watch runs during the query.
+		if (!isProcessAlive(pid)) {
+			forgetWindowsProcess(pid);
+			return undefined;
+		}
+		rememberWindowsStartTime(pid, startTime);
+		// remember drops the sample if the pid dies before the store.
+		const stored = windowsStartTimeCache.get(pid)?.startTime;
+		if (!stored || stored !== startTime) return undefined;
+		return { pid, processGroup: pid, startTime: stored };
+	};
+	if (!refresh) {
+		const cached = windowsStartTimeCache.get(pid);
+		if (cached) return { pid, processGroup: pid, startTime: cached.startTime };
+		// Cache miss is a one-time probe. Reconciliation does not use this path:
+		// the footer would block on PowerShell for every cold PID.
+		return queried();
+	}
+	// A refresh that misses must not answer with the previous creation time.
+	return queried();
+}
+
+/**
+ * Read a live process identity. `refresh` bypasses the Windows cache.
+ * A kill uses probeWindowsStartTime, which notices the pid dying during the query.
+ * Do not call refresh from a render or reconcile path: a cache miss blocks on PowerShell.
+ */
+export function readProcessIdentity(pid: number, options?: { refresh?: boolean }): ProcessIdentity | undefined {
+	if (process.platform === "win32") return readWindowsProcessIdentity(pid, options?.refresh === true);
 	if (process.platform !== "linux") return undefined;
 	try {
 		const stat = readFileSync(`/proc/${pid}/stat`, "utf8");
@@ -273,8 +457,20 @@ export function readProcessIdentity(pid: number): ProcessIdentity | undefined {
  * check a recycled PID would keep a dead run looking active forever.
  */
 function isRecordedProcessAlive(record: AgentRecord): boolean {
-	if (!record.pid || !isProcessAlive(record.pid)) return false;
+	if (!record.pid || !isProcessAlive(record.pid)) {
+		if (record.pid !== undefined && Number.isInteger(record.pid) && record.pid >= 1) forgetWindowsProcess(record.pid);
+		return false;
+	}
 	if (!record.pidStartTime) return true;
+	if (process.platform === "win32") {
+		const cached = windowsStartTimeCache.get(record.pid);
+		// A cached creation time that disagrees is a reused PID, even if the sample is old.
+		if (cached && cached.startTime !== record.pidStartTime) return false;
+		const fresh = !!cached && Date.now() - cached.fetchedAt < WINDOWS_IDENTITY_FRESH_MS;
+		if (!fresh) refreshProcessIdentitySoon(record.pid);
+		// Missing or stale agreement is not proof. Wait for a probe instead of marking the run dead.
+		return true;
+	}
 	const identity = readProcessIdentity(record.pid);
 	return !identity || identity.startTime === record.pidStartTime;
 }

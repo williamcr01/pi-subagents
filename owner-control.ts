@@ -1,7 +1,7 @@
-import { existsSync, mkdirSync, readFileSync, readdirSync, renameSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdirSync, readFileSync, readdirSync, rmSync, writeFileSync } from "node:fs";
 import { join } from "node:path";
 import { randomUUID } from "node:crypto";
-import { isProcessAlive } from "./registry.ts";
+import { isProcessAlive, renameReplacing } from "./registry.ts";
 
 interface Request {
 	version: 1;
@@ -30,7 +30,7 @@ export async function requestOwnerMessage(
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	try {
 		writeFileSync(join(dir, "request.tmp"), JSON.stringify({ ...request, version: 1, pid: process.pid }), { mode: 0o600 });
-		renameSync(join(dir, "request.tmp"), join(dir, "request.json"));
+		renameReplacing(join(dir, "request.tmp"), join(dir, "request.json"));
 		const deadline = Date.now() + (options.timeoutMs ?? 300_000);
 		while (true) {
 			if (options.signal?.aborted) throw new Error("Subagent message was aborted");
@@ -102,7 +102,7 @@ export function startOwnerMessageConsumer(
 				try {
 					// Never recreate revoked directories or replay accepted prompts.
 					writeFileSync(join(dir, "response.tmp"), JSON.stringify({ error }), { mode: 0o600 });
-					renameSync(join(dir, "response.tmp"), join(dir, "response.json"));
+					renameReplacing(join(dir, "response.tmp"), join(dir, "response.json"));
 				} catch { /* Sender revoked the request. */ }
 			})().finally(() => {
 				clearInterval(monitor);

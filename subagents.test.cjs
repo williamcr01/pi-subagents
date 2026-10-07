@@ -1,6 +1,7 @@
 // Regression tests for the subagents extension. No dependencies, no API calls.
 // Run: node subagents.test.cjs
 const { execSync, execFileSync, spawn: spawnProcess } = require("node:child_process");
+const childProcess = require("node:child_process");
 const fs = require("node:fs");
 const os = require("node:os");
 const path = require("node:path");
@@ -8,16 +9,110 @@ const path = require("node:path");
 // Install before jiti imports node:fs, which captures named function exports.
 let failMarkerWritesFor;
 let injectedMarkerFailures = 0;
+let renameFaults = 0;
+let failJsonRenames = false;
 const realRenameSync = fs.renameSync;
 fs.renameSync = (from, to) => {
+	if (failJsonRenames && String(to).endsWith(".json")) {
+		const error = new Error(`EPERM: operation not permitted, rename '${from}' -> '${to}'`);
+		error.code = "EPERM";
+		throw error;
+	}
 	if (failMarkerWritesFor && String(to).includes(failMarkerWritesFor) && /\.(resultsDelivered|resultsPreviewed)$/.test(String(to))) {
 		injectedMarkerFailures++;
 		throw new Error("injected marker write failure");
 	}
+	if (renameFaults > 0) {
+		renameFaults--;
+		const error = new Error(`EPERM: operation not permitted, rename '${from}' -> '${to}'`);
+		error.code = "EPERM";
+		throw error;
+	}
 	return realRenameSync(from, to);
 };
 
+// Installed before jiti captures child_process, so registry probes see the override.
+const realExecFileSync = childProcess.execFileSync;
+const realExecFile = childProcess.execFile;
+let windowsIdentityScript = null;
+let windowsIdentitySyncCalls = 0;
+let windowsIdentityAsyncCalls = 0;
+let windowsIdentityAsyncDelayMs = 0;
+let wherePiResult = null;
+function isPowershell(file) {
+	return /powershell(?:\.exe)?$/i.test(String(file));
+}
+childProcess.execFileSync = function (file, args, options) {
+	if (wherePiResult !== null && /where(?:\.exe)?$/i.test(path.basename(String(file)))) {
+		if (wherePiResult === "fail") throw new Error("injected where failure");
+		return wherePiResult;
+	}
+	if (windowsIdentityScript !== null && isPowershell(file)) {
+		windowsIdentitySyncCalls += 1;
+		if (windowsIdentityScript === "fail") {
+			const error = new Error("injected powershell failure");
+			error.code = "ETIMEDOUT";
+			throw error;
+		}
+		return `${windowsIdentityScript}\n`;
+	}
+	return realExecFileSync.call(this, file, args, options);
+};
+childProcess.execFile = function (file, args, options, callback) {
+	let cb = callback;
+	let opts = options;
+	if (typeof options === "function") {
+		cb = options;
+		opts = undefined;
+	}
+	if (windowsIdentityScript !== null && isPowershell(file)) {
+		windowsIdentityAsyncCalls += 1;
+		const script = windowsIdentityScript;
+		const delay = windowsIdentityAsyncDelayMs;
+		const deliver = () => {
+			if (script === "fail") {
+				const error = new Error("injected powershell failure");
+				error.code = "ETIMEDOUT";
+				cb(error, "", "");
+			} else {
+				cb(null, `${script}\n`, "");
+			}
+		};
+		if (delay > 0) setTimeout(deliver, delay);
+		else process.nextTick(deliver);
+		return undefined;
+	}
+	return realExecFile.call(this, file, args, opts, cb);
+};
+const realSpawn = childProcess.spawn;
+let taskkillMode = null;
+const taskkillCalls = [];
+childProcess.spawn = function (file, args, options) {
+	if (taskkillMode && /taskkill(?:\.exe)?$/i.test(path.basename(String(file)))) {
+		taskkillCalls.push([...(args ?? [])]);
+		if (taskkillMode === "fail-alive") {
+			const { EventEmitter } = require("node:events");
+			const child = new EventEmitter();
+			child.stdout = new EventEmitter();
+			child.stderr = new EventEmitter();
+			child.kill = () => {};
+			// Past the 1ms cache clock, so the retry probe is not treated as older than the sample just stored.
+			setTimeout(() => child.emit("close", 1), 30);
+			return child;
+		}
+	}
+	return realSpawn.call(this, file, args, options);
+};
+
 function findPiRoot() {
+	if (process.platform === "win32") {
+		const prefixes = [process.env.APPDATA && path.join(process.env.APPDATA, "npm"), process.env.LOCALAPPDATA && path.join(process.env.LOCALAPPDATA, "npm")].filter(Boolean);
+		for (const prefix of prefixes) {
+			const root = path.join(prefix, "node_modules", "@earendil-works", "pi-coding-agent");
+			if (fs.existsSync(path.join(root, "dist", "bundle", "cli.js"))) return root;
+		}
+		throw new Error("pi package not found; set PI_ROOT");
+	}
 	const bin = execSync("command -v pi", { encoding: "utf8" }).trim();
 	const real = fs.realpathSync(bin);
 	// <root>/dist/bundle/cli.js
@@ -772,7 +867,21 @@ function check(name, cond, extra) {
 	registry.saveRecord(agentDir2, mk("stale", "root", { status: "running_tool", pid: 2147483647 }));
 	const stale = registry.readRecords(agentDir2).find((r) => r.runId === "stale");
 	check("dead pid reconciled to failed", stale && stale.status === "failed", stale && stale.status);
-	if (process.platform === "linux") {
+	renameFaults = 2;
+	registry.saveRecord(agentDir2, mk("retry-write", "root", { latestText: "kept" }));
+	const retried = registry.readRecords(agentDir2).find((r) => r.runId === "retry-write");
+	check("rename EPERM is retried", retried?.latestText === "kept" && renameFaults === 0, retried?.latestText);
+	renameFaults = 20;
+	let persistentCode = "";
+	try {
+		registry.saveRecord(agentDir2, mk("persistent-eperm", "root"));
+	} catch (error) {
+		persistentCode = error.code ?? "";
+	}
+	renameFaults = 0;
+	check("persistent rename EPERM surfaces after retries", persistentCode === "EPERM", persistentCode);
+
+	if (process.platform === "linux" || process.platform === "win32") {
 		const identity = registry.readProcessIdentity(process.pid);
 		check("process identity exposes a start time", !!identity?.startTime);
 		registry.saveRecord(agentDir2, mk("live-pid", "root", { status: "thinking", pid: process.pid, pidStartTime: identity?.startTime }));
@@ -1462,6 +1571,301 @@ function check(name, cond, extra) {
 	check("owned cancellation waits for child exit", !registry.isProcessAlive(slowRec.pid), String(slowRec.pid));
 	check("child close persists PID clearing", closedSlow?.pid === undefined, String(closedSlow?.pid));
 
+	const jsonLockedRec = await spawn.startSubagent({ task: "slow", name: "rename-locked" }, { ...baseCtx() });
+	failJsonRenames = true;
+	let renameCancelThrew = false;
+	try {
+		spawn.cancelSubagent(spawnAgentDir, jsonLockedRec);
+	} catch {
+		renameCancelThrew = true;
+	} finally {
+		failJsonRenames = false;
+	}
+	let jsonLockedAlive = registry.isProcessAlive(jsonLockedRec.pid);
+	for (let i = 0; i < 40 && jsonLockedAlive; i++) {
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		jsonLockedAlive = registry.isProcessAlive(jsonLockedRec.pid);
+	}
+	const jsonLockedRow = registry.readRecords(spawnAgentDir).find((r) => r.runId === jsonLockedRec.runId);
+	check(
+		"cancel still kills the child when the record rename fails after the marker is written",
+		!renameCancelThrew && registry.isRecordCancelled(spawnAgentDir, jsonLockedRec.runId) && !jsonLockedAlive && jsonLockedRow?.status === "cancelled",
+		`threw=${renameCancelThrew} marker=${registry.isRecordCancelled(spawnAgentDir, jsonLockedRec.runId)} alive=${jsonLockedAlive} status=${jsonLockedRow?.status} pid=${jsonLockedRec.pid}`,
+	);
+
+	if (process.platform === "win32") {
+		const pidProbe = spawnProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		const identity = registry.readProcessIdentity(pidProbe.pid, { refresh: true });
+		check("windows process probe has a start time", !!identity?.startTime, String(pidProbe.pid));
+		await spawn.killPidTree(pidProbe.pid, "not-the-recorded-start-time");
+		check("windows PID identity mismatch prevents stale-record kill", registry.isProcessAlive(pidProbe.pid), String(pidProbe.pid));
+		if (identity?.startTime) await spawn.killPidTree(pidProbe.pid, identity.startTime);
+		else await spawn.killPidTree(pidProbe.pid);
+		check("matching windows identity is killed", !registry.isProcessAlive(pidProbe.pid), String(pidProbe.pid));
+
+		const cachedProbe = spawnProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 100));
+		windowsIdentitySyncCalls = 0;
+		windowsIdentityAsyncCalls = 0;
+		windowsIdentityScript = "fail";
+		registry.saveRecord(agentDir2, mk("cold-pid", "root", { status: "thinking", pid: cachedProbe.pid, pidStartTime: "111" }));
+		const cold = registry.readRecords(agentDir2).find((r) => r.runId === "cold-pid");
+		const probesAfterFirstRead = windowsIdentityAsyncCalls;
+		const coldAgain = registry.readRecords(agentDir2).find((r) => r.runId === "cold-pid");
+		check(
+			"cold reconcile does not call PowerShell synchronously",
+			windowsIdentitySyncCalls === 0 && cold?.status === "thinking" && coldAgain?.status === "thinking",
+			`${cold?.status}/${coldAgain?.status} sync=${windowsIdentitySyncCalls} async=${windowsIdentityAsyncCalls}`,
+		);
+		check(
+			"an in-flight identity probe is not started again",
+			probesAfterFirstRead > 0 && windowsIdentityAsyncCalls === probesAfterFirstRead,
+			`${probesAfterFirstRead} -> ${windowsIdentityAsyncCalls}`,
+		);
+		windowsIdentityScript = "111";
+		const primed = registry.readProcessIdentity(cachedProbe.pid, { refresh: true });
+		check("injected identity is visible", primed?.startTime === "111", primed?.startTime);
+		windowsIdentityScript = "fail";
+		const failedRefresh = registry.readProcessIdentity(cachedProbe.pid, { refresh: true });
+		check("failed refresh does not reuse the cached start time", failedRefresh === undefined, failedRefresh?.startTime);
+		windowsIdentityScript = "222";
+		await spawn.killPidTree(cachedProbe.pid, "111");
+		check("fresh identity mismatch prevents kill", registry.isProcessAlive(cachedProbe.pid), String(cachedProbe.pid));
+		registry.saveRecord(agentDir2, mk("reused-pid", "root", { status: "thinking", pid: cachedProbe.pid, pidStartTime: "111" }));
+		registry.readProcessIdentity(cachedProbe.pid, { refresh: true });
+		const reused = registry.readRecords(agentDir2).find((r) => r.runId === "reused-pid");
+		check("changed windows start time reconciles the run", reused?.status === "failed", reused?.status);
+		windowsIdentityAsyncDelayMs = 80;
+		windowsIdentityScript = "111";
+		const lateProbe = registry.probeWindowsStartTime(cachedProbe.pid);
+		windowsIdentityScript = "222";
+		const newerIdentity = registry.readProcessIdentity(cachedProbe.pid, { refresh: true });
+		const lateResult = await lateProbe;
+		const afterLate = registry.readProcessIdentity(cachedProbe.pid);
+		check(
+			"a late identity probe does not overwrite a newer sample",
+			newerIdentity?.startTime === "222" && lateResult === "222" && afterLate?.startTime === "222",
+			`${newerIdentity?.startTime}/${lateResult}/${afterLate?.startTime}`,
+		);
+		windowsIdentityScript = "fail";
+		const lateFailure = registry.probeWindowsStartTime(cachedProbe.pid);
+		windowsIdentityScript = "333";
+		registry.readProcessIdentity(cachedProbe.pid, { refresh: true });
+		await lateFailure;
+		const keptIdentity = registry.readProcessIdentity(cachedProbe.pid);
+		check("a late failed probe keeps a newer sample", keptIdentity?.startTime === "333", keptIdentity?.startTime);
+		windowsIdentityAsyncDelayMs = 0;
+		windowsIdentityScript = "fail";
+		await spawn.killPidTree(cachedProbe.pid, "111");
+		check("explicit cancel kills when the identity probe fails", !registry.isProcessAlive(cachedProbe.pid), String(cachedProbe.pid));
+		windowsIdentityScript = null;
+
+		const retryProbe = spawnProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		windowsIdentityScript = "111";
+		windowsIdentityAsyncDelayMs = 0;
+		taskkillCalls.length = 0;
+		taskkillMode = "fail-alive";
+		const retryKill = spawn.killPidTree(retryProbe.pid, "111");
+		windowsIdentityScript = "222";
+		await retryKill;
+		check(
+			"a failed taskkill does not retry against a reused pid",
+			registry.isProcessAlive(retryProbe.pid) && taskkillCalls.length === 1,
+			`alive=${registry.isProcessAlive(retryProbe.pid)} kills=${taskkillCalls.length}`,
+		);
+		taskkillMode = null;
+		windowsIdentityScript = null;
+		if (registry.isProcessAlive(retryProbe.pid)) retryProbe.kill();
+
+		const invalidSyncBefore = windowsIdentitySyncCalls;
+		windowsIdentityScript = "1";
+		const invalidIdentity = registry.readProcessIdentity(0, { refresh: true });
+		const negativeIdentity = registry.readProcessIdentity(-5, { refresh: true });
+		check(
+			"an invalid pid does not query or get an identity",
+			invalidIdentity === undefined && negativeIdentity === undefined && windowsIdentitySyncCalls === invalidSyncBefore,
+			`sync=${windowsIdentitySyncCalls}`,
+		);
+		windowsIdentityScript = null;
+
+		windowsIdentitySyncCalls = 0;
+		windowsIdentityAsyncCalls = 0;
+		windowsIdentityScript = "424242";
+		const identRec = await spawn.startSubagent({ task: "hang", name: "ident" }, baseCtx());
+		let identRow;
+		for (let i = 0; i < 50; i++) {
+			identRow = registry.readRecords(spawnAgentDir).find((r) => r.runId === identRec.runId);
+			if (identRow?.pidStartTime || identRow?.status === "failed") break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		check(
+			"spawn stores the async probe and does not block on execFileSync",
+			windowsIdentitySyncCalls === 0 && windowsIdentityAsyncCalls >= 1 && identRow?.pidStartTime === "424242",
+			`sync=${windowsIdentitySyncCalls} async=${windowsIdentityAsyncCalls} start=${identRow?.pidStartTime} status=${identRow?.status}`,
+		);
+		windowsIdentityScript = null;
+		await spawn.terminateOwnedSubagents([identRec.runId]);
+
+		taskkillCalls.length = 0;
+		taskkillMode = "fail-alive";
+		const hangRec = await spawn.startSubagent({ task: "hang", name: "unkillable" }, baseCtx());
+		let hangRow;
+		for (let i = 0; i < 50; i++) {
+			hangRow = registry.readRecords(spawnAgentDir).find((r) => r.runId === hangRec.runId);
+			if (hangRow?.pid) break;
+			await new Promise((resolve) => setTimeout(resolve, 20));
+		}
+		let terminationError;
+		try {
+			await spawn.terminateOwnedSubagents([hangRec.runId]);
+		} catch (error) {
+			terminationError = error;
+		}
+		check(
+			"a failed taskkill does not skip the shutdown wait",
+			terminationError === undefined && hangRow?.pid > 0,
+			`${terminationError && terminationError.message} pid=${hangRow?.pid}`,
+		);
+		taskkillMode = null;
+		if (hangRow?.pid && registry.isProcessAlive(hangRow.pid)) await spawn.killPidTree(hangRow.pid);
+
+		const orphan = spawnProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		windowsIdentityAsyncDelayMs = 150;
+		windowsIdentityScript = "fail";
+		registry.saveRecord(agentDir2, mk("external-kill", "root", { status: "thinking", pid: orphan.pid, pidStartTime: "1" }));
+		spawn.cancelSubagent(agentDir2, registry.readRecords(agentDir2).find((r) => r.runId === "external-kill"));
+		check("unowned cancel returns before the windows kill finishes", registry.isProcessAlive(orphan.pid), String(orphan.pid));
+		await spawn.settleExternalKills();
+		check("shutdown can wait for an unowned windows kill", !registry.isProcessAlive(orphan.pid), String(orphan.pid));
+		windowsIdentityAsyncDelayMs = 0;
+		windowsIdentityScript = null;
+		if (registry.isProcessAlive(orphan.pid)) orphan.kill();
+
+		const remembered = spawnProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		const realKill = process.kill.bind(process);
+		let livenessProbes = 0;
+		process.kill = (pid, signal) => {
+			if (pid === remembered.pid && signal === 0) {
+				livenessProbes += 1;
+				// The third probe is rememberWindowsStartTime, after the post-query check passed.
+				if (livenessProbes === 3) {
+					const error = new Error("dead");
+					error.code = "ESRCH";
+					throw error;
+				}
+			}
+			return realKill(pid, signal);
+		};
+		try {
+			windowsIdentityScript = "555";
+			const rejected = registry.readProcessIdentity(remembered.pid, { refresh: true });
+			check(
+				"a start time rejected at store is not returned",
+				livenessProbes === 3 && rejected === undefined,
+				`probes=${livenessProbes} value=${rejected && rejected.startTime}`,
+			);
+		} finally {
+			process.kill = realKill;
+			windowsIdentityScript = null;
+			if (registry.isProcessAlive(remembered.pid)) remembered.kill();
+		}
+
+		const dying = spawnProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+			stdio: "ignore",
+			windowsHide: true,
+		});
+		await new Promise((resolve) => setTimeout(resolve, 50));
+		windowsIdentityAsyncDelayMs = 250;
+		windowsIdentityScript = "111";
+		const dyingProbe = registry.probeWindowsStartTime(dying.pid);
+		windowsIdentityScript = "222";
+		const newerDying = registry.readProcessIdentity(dying.pid, { refresh: true });
+		dying.kill();
+		await new Promise((resolve) => dying.once("close", resolve));
+		const dyingResult = await dyingProbe;
+		check(
+			"a probe that observed death does not return the cached start time",
+			newerDying?.startTime === "222" && dyingResult === undefined,
+			`${newerDying && newerDying.startTime}/${dyingResult}`,
+		);
+		windowsIdentityAsyncDelayMs = 0;
+		windowsIdentityScript = null;
+
+		const shimDir = path.join(sandbox, "shim");
+		const shimCli = path.join(shimDir, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+		fs.mkdirSync(path.dirname(shimCli), { recursive: true });
+		fs.writeFileSync(shimCli, "");
+		const shimCmd = path.join(shimDir, "pi.cmd");
+		fs.writeFileSync(shimCmd, `@ECHO OFF\r\n"%dp0%\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*\r\n`);
+		check("cmd-shim %dp0% resolves to the pi cli", spawn.scriptFromShim(shimCmd) === path.resolve(shimCli), spawn.scriptFromShim(shimCmd));
+		const shimPs1 = path.join(shimDir, "pi.ps1");
+		fs.writeFileSync(shimPs1, `& "%~dp0node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" @args\r\n`);
+		check("powershell shim %~dp0 resolves to the pi cli", spawn.scriptFromShim(shimPs1) === path.resolve(shimCli), spawn.scriptFromShim(shimPs1));
+		const dollarDir = path.join(sandbox, "a$&b");
+		const dollarCli = path.join(dollarDir, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+		fs.mkdirSync(path.dirname(dollarCli), { recursive: true });
+		fs.writeFileSync(dollarCli, "");
+		const dollarShim = path.join(dollarDir, "pi.cmd");
+		fs.writeFileSync(dollarShim, `"%dp0%\\node_modules\\@earendil-works\\pi-coding-agent\\dist\\bundle\\cli.js" %*\r\n`);
+		check("shim directory $& is substituted literally", spawn.scriptFromShim(dollarShim) === path.resolve(dollarCli), spawn.scriptFromShim(dollarShim));
+		const badShim = path.join(shimDir, "bad.cmd");
+		fs.writeFileSync(path.join(shimDir, "other.js"), "");
+		fs.writeFileSync(badShim, `"%dp0%\\other.js"\r\n`);
+		check("shim target that is not the pi cli is ignored", spawn.scriptFromShim(badShim) === undefined);
+		const exeDir = path.join(sandbox, "fake-exe");
+		fs.mkdirSync(exeDir);
+		const fakeExe = path.join(exeDir, "pi.exe");
+		const fakeJs = path.join(exeDir, "pi.js");
+		fs.writeFileSync(fakeExe, "");
+		fs.writeFileSync(fakeJs, "");
+		wherePiResult = `${fakeJs}\r\n${fakeExe}\r\n${shimCmd}\r\n`;
+		const launched = spawn.windowsPiLaunch(["--mode", "rpc"]);
+		check(
+			"where.exe skips a non-cli pi.js and pi.exe",
+			launched?.command === process.execPath && launched?.args[0] === path.resolve(shimCli),
+			JSON.stringify(launched),
+		);
+		wherePiResult = "fail";
+		const prefixRoot = path.join(sandbox, "npm-prefix");
+		const prefixCli = path.join(prefixRoot, "npm", "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+		fs.mkdirSync(path.dirname(prefixCli), { recursive: true });
+		fs.writeFileSync(prefixCli, "");
+		const oldAppData = process.env.APPDATA;
+		const oldLocalAppData = process.env.LOCALAPPDATA;
+		const oldNpmPrefix = process.env.npm_config_prefix;
+		process.env.APPDATA = prefixRoot;
+		process.env.LOCALAPPDATA = path.join(sandbox, "no-local-npm");
+		delete process.env.npm_config_prefix;
+		const fromPrefix = spawn.windowsPiLaunch(["--mode", "rpc"]);
+		if (oldAppData === undefined) delete process.env.APPDATA;
+		else process.env.APPDATA = oldAppData;
+		if (oldLocalAppData === undefined) delete process.env.LOCALAPPDATA;
+		else process.env.LOCALAPPDATA = oldLocalAppData;
+		if (oldNpmPrefix === undefined) delete process.env.npm_config_prefix;
+		else process.env.npm_config_prefix = oldNpmPrefix;
+		wherePiResult = null;
+		check("npm prefix is used when where.exe finds nothing", fromPrefix?.args[0] === path.resolve(prefixCli), JSON.stringify(fromPrefix));
+	}
+
 	if (process.platform === "linux") {
 		const pidProbe = spawnProcess(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
 			detached: true,
@@ -1621,6 +2025,42 @@ function check(name, cond, extra) {
 	if (savedAgentDir === undefined) delete process.env.PI_CODING_AGENT_DIR;
 	else process.env.PI_CODING_AGENT_DIR = savedAgentDir;
 
+	process.env.FAKE_DELAY_MS = "1500";
+	const lockedRec = await spawn.startSubagent(
+		{ task: "lock", name: "locked-registry" },
+		{ ...baseCtx(), persistAfterSettled: false },
+	);
+	for (let i = 0; i < 50; i++) {
+		const row = registry.readRecords(spawnAgentDir).find((r) => r.runId === lockedRec.runId);
+		if (row && row.status !== "queued") break;
+		await new Promise((resolve) => setTimeout(resolve, 20));
+	}
+	renameFaults = 400;
+	const lockedMarker = path.join(registry.registryDir(spawnAgentDir), `${lockedRec.runId}.closed`);
+	for (let i = 0; i < 120; i++) {
+		if (lockedRec.status === "completed" && lockedRec.pid === undefined) break;
+		await new Promise((resolve) => setTimeout(resolve, 50));
+	}
+	const lockedMid = registry.readRecords(spawnAgentDir).find((r) => r.runId === lockedRec.runId);
+	check(
+		"terminal publish stays unsaved while renames fail",
+		lockedRec.status === "completed" && lockedRec.pid === undefined && lockedMid?.status !== "completed" && !fs.existsSync(lockedMarker),
+		`mem=${lockedRec.status}/${lockedRec.pid} disk=${lockedMid?.status} faults=${renameFaults} marker=${fs.existsSync(lockedMarker)}`,
+	);
+	renameFaults = 0;
+	delete process.env.FAKE_DELAY_MS;
+	let lockedDone;
+	for (let i = 0; i < 40; i++) {
+		lockedDone = registry.readRecords(spawnAgentDir).find((r) => r.runId === lockedRec.runId);
+		if (lockedDone?.status === "completed" && lockedDone.pid === undefined && fs.existsSync(lockedMarker)) break;
+		await new Promise((resolve) => setTimeout(resolve, 100));
+	}
+	check(
+		"transient registry EPERM retries until the terminal status is saved",
+		lockedDone?.status === "completed" && lockedDone.pid === undefined && fs.existsSync(lockedMarker),
+		lockedDone && `${lockedDone.status} pid=${lockedDone.pid} marker=${fs.existsSync(lockedMarker)} faults-left-were-cleared`,
+	);
+
 	delete process.env.PI_SUBAGENT_COMMAND;
 
 	// --- footer tree: main + nested children ---
@@ -1645,6 +2085,30 @@ function check(name, cond, extra) {
 	check("footer keeps only running", afterDismiss.some((l) => l.includes("bash npm test")) && !afterDismiss.some((l) => l.includes("a1")), afterDismiss.join(" | "));
 	check("review still opens history", tree.openReview() === true);
 	tree.dispose();
+
+	const cancelDir = path.join(sandbox, "cancel-key");
+	fs.mkdirSync(cancelDir, { recursive: true });
+	registry.saveRecord(cancelDir, mk("root", ""));
+	registry.saveRecord(cancelDir, mk("busy", "root", { status: "running_tool" }));
+	let cancelAttempts = 0;
+	let escaped = false;
+	const cancelPanel = new SubagentPanel(tui, theme, cancelDir, "root", {
+		onCancel(record) {
+			cancelAttempts++;
+			spawn.cancelSubagent(cancelDir, record);
+		},
+	});
+	check("cancel panel opens a running row", cancelPanel.open() === true);
+	renameFaults = 100;
+	try {
+		cancelPanel.handleInput("x");
+	} catch {
+		escaped = true;
+	} finally {
+		renameFaults = 0;
+	}
+	check("cancel key survives a registry rename failure", cancelAttempts === 1 && !escaped, `attempts=${cancelAttempts} escaped=${escaped}`);
+	cancelPanel.dispose();
 
 	// --- transcript: child session renders like the main agent ---
 	const { buildTranscript } = await jiti.import(path.join(HERE, "transcript.ts"));
@@ -1684,7 +2148,15 @@ function check(name, cond, extra) {
 	const longRendered = longComps && longComps.flatMap((c) => c.render(100)).join("\n");
 	check("full transcript keeps first prompt past 60 messages", !!longRendered && longRendered.includes("the very first delegated prompt"), longRendered && longRendered.slice(0, 200));
 
-	fs.rmSync(sandbox, { recursive: true, force: true });
+	for (let attempt = 0; attempt < 5; attempt++) {
+		try {
+			fs.rmSync(sandbox, { recursive: true, force: true });
+			break;
+		} catch (error) {
+			if (attempt === 4) console.error(`sandbox cleanup failed: ${error.message}`);
+			else Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 100);
+		}
+	}
 	console.log(failures === 0 ? "\nALL PASS" : `\n${failures} FAILURES`);
 	process.exit(failures === 0 ? 0 : 1);
 })().catch((e) => {

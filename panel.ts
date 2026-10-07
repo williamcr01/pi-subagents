@@ -354,7 +354,14 @@ export class SubagentPanel implements Component, Focusable {
 		}
 		if (data === "x") {
 			const record = this.rows()[this.selected];
-			if (record && !isTerminal(record)) this.options.onCancel?.(record);
+			if (record && !isTerminal(record)) {
+				try {
+					this.options.onCancel?.(record);
+				} catch {
+					// stdin delivers this key. The callback's failure must not
+					// become the uncaughtException that exits Pi.
+				}
+			}
 			this.tui.requestRender();
 		}
 	}

@@ -106,15 +106,23 @@ process.stdin.on("data", (chunk) => {
 		try { command = JSON.parse(raw); } catch { continue; }
 		if (command.type === "get_state") {
 			if (mode === "ignore-state") continue;
+			if (mode === "close-stdin") {
+				// Windows anonymous pipes do not report EPIPE for a short write after stdin is closed.
+				// Drop further input and exit so the parent fails on process close instead of completing the turn or waiting out the RPC deadline.
+				process.stdin.destroy();
+				process.stdout.write(`${JSON.stringify({ type: "response", id: command.id, command: "get_state", success: true, data: {
+					sessionId, thinkingLevel: "off", isStreaming: false, isCompacting: false,
+					steeringMode: "one-at-a-time", followUpMode: "one-at-a-time",
+					autoCompactionEnabled: true, messageCount: 0, pendingMessageCount: 0,
+				} })}\n`, () => process.exit(0));
+				setTimeout(() => process.exit(0), 50);
+				return;
+			}
 			line({ type: "response", id: command.id, command: "get_state", success: true, data: {
 				sessionId, thinkingLevel: "off", isStreaming: false, isCompacting: false,
 				steeringMode: "one-at-a-time", followUpMode: "one-at-a-time",
 				autoCompactionEnabled: true, messageCount: 0, pendingMessageCount: 0,
 			} });
-			if (mode === "close-stdin") {
-				require("node:fs").closeSync(0);
-				setInterval(() => {}, 1000);
-			}
 		} else if (command.type === "prompt" || command.type === "steer" || command.type === "follow_up") {
 			if (command.message === "hang") continue;
 			if (typeof command.message === "string" && command.message.startsWith("delay-rpc ")) {

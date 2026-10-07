@@ -1,7 +1,7 @@
-import { spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
+import { execFileSync, spawn, type ChildProcessWithoutNullStreams } from "node:child_process";
 import { randomUUID } from "node:crypto";
-import { existsSync, readdirSync, realpathSync, statSync } from "node:fs";
-import { basename, isAbsolute, join, relative, resolve } from "node:path";
+import { existsSync, readFileSync, readdirSync, realpathSync, statSync } from "node:fs";
+import { basename, dirname, isAbsolute, join, relative, resolve } from "node:path";
 import { StringDecoder } from "node:string_decoder";
 import { SessionManager } from "@earendil-works/pi-coding-agent";
 import { DEFAULT_SETTINGS, validateRpcMaxLineChars, validateThinkingLevel } from "./config.ts";
@@ -12,6 +12,8 @@ import {
 	isProcessAlive,
 	isRecordCancelled,
 	isTerminalStatus,
+	isTransientFsError,
+	probeWindowsStartTime,
 	readProcessIdentity,
 	type ProcessIdentity,
 	readRecords,
@@ -19,6 +21,24 @@ import {
 	withRecordLock,
 } from "./registry.ts";
 import { EMPTY_USAGE, type AgentRecord, type SpawnAgentInput, type SubagentSettings } from "./types.ts";
+
+const externalKills = new Set<Promise<void>>();
+
+function trackExternalKill(kill: Promise<void>): void {
+	externalKills.add(kill);
+	void kill.finally(() => {
+		externalKills.delete(kill);
+	});
+}
+
+/**
+ * Wait for unowned kills started by cancelSubagent.
+ * session_shutdown returns into process.exit, and on Windows the kill waits
+ * on PowerShell before taskkill is spawned.
+ */
+export function settleExternalKills(): Promise<void> {
+	return Promise.all([...externalKills]).then(() => undefined);
+}
 
 const STDERR_LIMIT = 4000;
 const TERMINATION_WAIT_MS = 5000;
@@ -146,20 +166,162 @@ export interface SpawnContext {
 	stdoutLineLimit?: number;
 }
 
-function getPiInvocation(args: string[]): { command: string; args: string[] } {
+function cliJsBeside(directory: string): string | undefined {
+	const script = join(directory, "node_modules", "@earendil-works", "pi-coding-agent", "dist", "bundle", "cli.js");
+	return existsSync(script) ? script : undefined;
+}
+
+function isPiCli(script: string): boolean {
+	const normalized = resolve(script).replace(/[\\/]/g, "\\").toLowerCase();
+	return normalized.endsWith("\\pi-coding-agent\\dist\\bundle\\cli.js") && existsSync(resolve(script));
+}
+
+/** Read cli.js out of a pi.cmd / pi.ps1 shim. npm writes `%dp0%`, cmd's own form is `%~dp0`. */
+export function scriptFromShim(shimPath: string): string | undefined {
+	let text = "";
+	try {
+		text = readFileSync(shimPath, "utf8");
+	} catch {
+		return undefined;
+	}
+	const dir = dirname(shimPath);
+	// A string replacement treats $& and $' as pieces of the match.
+	const expand = (): string => `${dir}\\`;
+	const expanded = text.replace(/%~dp0/gi, expand).replace(/%dp0%/gi, expand);
+	const match = expanded.match(/[A-Za-z]:\\[^"'\r\n]*\\cli\.js|(?:\/|[A-Za-z]:\/)[^"'\r\n]*\/cli\.js/);
+	if (!match) return undefined;
+	const script = resolve(match[0]);
+	return isPiCli(script) ? script : undefined;
+}
+
+function launchPiCli(script: string, args: string[]): { command: string; args: string[] } {
+	return { command: process.execPath, args: [script, ...args] };
+}
+
+/**
+ * Find the pi CLI without launching pi.cmd or an unrelated pi.exe/pi.js.
+ * PATH wins over a stale global npm prefix. Nothing found returns undefined;
+ * the caller falls back to spawn("pi") rather than throwing.
+ */
+export function windowsPiLaunch(args: string[]): { command: string; args: string[] } | undefined {
+	const fromTarget = (target: string): { command: string; args: string[] } | undefined => {
+		const lower = target.toLowerCase();
+		if (lower.endsWith(".js")) {
+			const script = resolve(target);
+			return isPiCli(script) ? launchPiCli(script, args) : undefined;
+		}
+		if (lower.endsWith(".exe")) {
+			const beside = cliJsBeside(dirname(target));
+			return beside ? launchPiCli(beside, args) : undefined;
+		}
+		const beside = cliJsBeside(dirname(target));
+		if (beside) return launchPiCli(beside, args);
+		const parsed = scriptFromShim(target);
+		return parsed ? launchPiCli(parsed, args) : undefined;
+	};
+	let listed = "";
+	try {
+		listed = execFileSync("where.exe", ["pi"], { encoding: "utf8", windowsHide: true, timeout: 2000 });
+	} catch {
+		listed = "";
+	}
+	for (const line of listed.split(/\r?\n/)) {
+		const target = line.trim();
+		if (!target || !existsSync(target)) continue;
+		const launch = fromTarget(target);
+		if (launch) return launch;
+	}
+	const prefixes = [
+		process.env.APPDATA && join(process.env.APPDATA, "npm"),
+		process.env.LOCALAPPDATA && join(process.env.LOCALAPPDATA, "npm"),
+		process.env.npm_config_prefix,
+	].filter((prefix): prefix is string => !!prefix);
+	for (const prefix of prefixes) {
+		const script = cliJsBeside(prefix);
+		if (script) return launchPiCli(script, args);
+	}
+	return undefined;
+}
+
+function resolvePiLaunch(): { command: string; leadingArgs: string[] } {
 	// Test hook: run a fake child instead of the real pi binary.
 	const override = process.env.PI_SUBAGENT_COMMAND;
-	if (override) return { command: process.execPath, args: [override, ...args] };
+	if (override) return { command: process.execPath, leadingArgs: [override] };
 
 	const currentScript = process.argv[1];
 	const isBunVirtualScript = currentScript?.startsWith("/$bunfs/root/");
 	if (currentScript && !isBunVirtualScript && existsSync(currentScript)) {
-		return { command: process.execPath, args: [currentScript, ...args] };
+		return { command: process.execPath, leadingArgs: [currentScript] };
+	}
+	// spawn("pi") cannot execute pi.cmd, and shell:true would parse the prompt as cmd syntax.
+	if (process.platform === "win32") {
+		const launch = windowsPiLaunch([]);
+		if (launch) return { command: launch.command, leadingArgs: launch.args };
+		const host = basename(process.execPath).toLowerCase();
+		return /^(node|bun)(\.exe)?$/.test(host)
+			? { command: "pi", leadingArgs: [] }
+			: { command: process.execPath, leadingArgs: [] };
 	}
 	const executable = basename(process.execPath).toLowerCase();
 	return /^(node|bun)(\.exe)?$/.test(executable)
-		? { command: "pi", args }
-		: { command: process.execPath, args };
+		? { command: "pi", leadingArgs: [] }
+		: { command: process.execPath, leadingArgs: [] };
+}
+
+function getPiInvocation(args: string[]): { command: string; args: string[] } {
+	const launch = resolvePiLaunch();
+	return { command: launch.command, args: [...launch.leadingArgs, ...args] };
+}
+
+function taskkillTree(
+	pid: number,
+	remaining = 1,
+	expectedStartTime?: string,
+	exited?: () => boolean,
+): Promise<void> {
+	return new Promise((resolve, reject) => {
+		let detail = "";
+		let settled = false;
+		const child = spawn("taskkill", ["/pid", String(pid), "/t", "/f"], {
+			windowsHide: true,
+			stdio: ["ignore", "pipe", "pipe"],
+		});
+		const timer = setTimeout(() => {
+			child.kill();
+		}, 15_000);
+		child.stdout?.on("data", (chunk: Buffer) => { detail += chunk.toString("utf8"); });
+		child.stderr?.on("data", (chunk: Buffer) => { detail += chunk.toString("utf8"); });
+		// The first taskkill can fail after this pid has been reused. Check again
+		// before the retry, or the second taskkill stops whoever owns the number now.
+		const retry = async (): Promise<void> => {
+			if (exited?.()) return;
+			if (!isProcessAlive(pid)) return;
+			if (expectedStartTime) {
+				let startTime = await probeWindowsStartTime(pid);
+				if (startTime === undefined) startTime = await probeWindowsStartTime(pid);
+				if (exited?.()) return;
+				if (!isProcessAlive(pid)) return;
+				if (startTime !== undefined && startTime !== expectedStartTime) return;
+			}
+			return taskkillTree(pid, remaining - 1, expectedStartTime, exited);
+		};
+		const finish = (status: number | null, error?: Error) => {
+			if (settled) return;
+			settled = true;
+			clearTimeout(timer);
+			if (!isProcessAlive(pid) || status === 0 || status === 128 || /not found|no running instance/i.test(detail)) {
+				resolve();
+				return;
+			}
+			if (remaining > 0) {
+				resolve(retry());
+				return;
+			}
+			reject(error ?? new Error(detail.trim() || `taskkill failed for pid ${pid}`));
+		};
+		child.once("error", (error) => finish(null, error));
+		child.once("close", (status) => finish(status));
+	});
 }
 
 function validateToolName(name: string): void {
@@ -297,9 +459,18 @@ function signalPidTree(pid: number, signal: NodeJS.Signals): void {
  * matches. Other platforms avoid a delayed PID-only kill that could hit a
  * reused PID.
  */
-export function killPidTree(pid: number, expectedStartTime?: string): void {
+export async function killPidTree(pid: number, expectedStartTime?: string): Promise<void> {
 	if (process.platform === "win32") {
-		spawn("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+		if (expectedStartTime) {
+			if (!isProcessAlive(pid)) return;
+			let startTime = await probeWindowsStartTime(pid);
+			if (startTime === undefined) startTime = await probeWindowsStartTime(pid);
+			// A different creation time is a reused PID. A failed probe still kills:
+			// the caller asked to stop this recorded process, and the cache is not a match.
+			if (startTime !== undefined && startTime !== expectedStartTime) return;
+			if (!isProcessAlive(pid)) return;
+		}
+		await taskkillTree(pid, 1, expectedStartTime);
 		return;
 	}
 	const leader = readProcessIdentity(pid);
@@ -326,7 +497,11 @@ function waitTimeout(ms: number): Promise<void> {
 	});
 }
 
-function ownChild(runId: string, child: ChildProcessWithoutNullStreams): OwnedChild {
+function ownChild(
+	runId: string,
+	child: ChildProcessWithoutNullStreams,
+	expectedStartTime?: () => string | undefined,
+): OwnedChild {
 	const pid = child.pid;
 	if (!pid) throw new Error("Subagent process started without a PID");
 	let closed = false;
@@ -338,7 +513,8 @@ function ownChild(runId: string, child: ChildProcessWithoutNullStreams): OwnedCh
 		closed = true;
 		resolveClosed();
 	});
-	const identity = readProcessIdentity(pid);
+	// Windows kill does not use this sample, and a cache miss blocks on PowerShell.
+	const identity = process.platform === "win32" ? undefined : readProcessIdentity(pid);
 	let terminating: Promise<void> | undefined;
 	const owned: OwnedChild = {
 		pid,
@@ -347,7 +523,9 @@ function ownChild(runId: string, child: ChildProcessWithoutNullStreams): OwnedCh
 			if (terminating) return terminating;
 			terminating = (async () => {
 				if (process.platform === "win32") {
-					spawn("taskkill", ["/pid", String(pid), "/t", "/f"], { stdio: "ignore", windowsHide: true });
+					// `close` waits for stdio, so after `exit` this pid may already belong to someone else.
+					const exited = () => child.exitCode !== null || child.signalCode !== null;
+					if (!exited()) await taskkillTree(pid, 1, expectedStartTime?.(), exited);
 				} else {
 					signalPidTree(pid, "SIGTERM");
 					const timer = setTimeout(() => {
@@ -380,26 +558,72 @@ export function cancelSubagent(agentDir: string, record: AgentRecord): AgentReco
 	const cancelOne = (item: AgentRecord): AgentRecord => {
 		let updated!: AgentRecord;
 		let pid: number | undefined;
+		let startTime: string | undefined;
 		let owned: OwnedChild | undefined;
-		withRecordLock(agentDir, item.runId, () => {
-			const latest = readRecords(agentDir).find((candidate) => candidate.runId === item.runId) ?? item;
-			const now = new Date().toISOString();
-			updated = saveRecord(agentDir, {
-				...latest,
+		const armStop = () => {
+			owned = owned ?? ownedChildren.get(item.runId);
+			runAbortControllers.get(item.runId)?.abort();
+			liveChildren.get(item.runId)?.abort();
+		};
+		try {
+			withRecordLock(agentDir, item.runId, () => {
+				const latest = readRecords(agentDir).find((candidate) => candidate.runId === item.runId) ?? item;
+				pid = latest.pid;
+				startTime = latest.pidStartTime;
+				const now = new Date().toISOString();
+				updated = saveRecord(agentDir, {
+					...latest,
+					status: "cancelled",
+					activity: "cancelled",
+					currentTool: undefined,
+					error: latest.error ?? "Cancelled",
+					finishedAt: latest.finishedAt ?? now,
+					updatedAt: now,
+				});
+				pid = updated.pid ?? pid;
+				startTime = updated.pidStartTime ?? startTime;
+				armStop();
+			});
+		} catch (error) {
+			// The marker is written before the JSON rename. A sharing violation must not
+			// leave the panel showing cancelled while the child keeps running.
+			if (!isRecordCancelled(agentDir, item.runId)) throw error;
+			armStop();
+			updated = readRecords(agentDir).find((candidate) => candidate.runId === item.runId) ?? {
+				...item,
 				status: "cancelled",
 				activity: "cancelled",
 				currentTool: undefined,
-				error: latest.error ?? "Cancelled",
-				finishedAt: latest.finishedAt ?? now,
-				updatedAt: now,
+				error: item.error ?? "Cancelled",
+			};
+			pid = pid ?? updated.pid;
+			startTime = startTime ?? updated.pidStartTime;
+		}
+		if (owned) {
+			const termination = owned.terminate();
+			void termination.catch(() => {
+				// Cancel already persisted. Shutdown awaits this same promise and sees the failure.
 			});
-			owned = ownedChildren.get(item.runId);
-			pid = updated.pid;
-			runAbortControllers.get(item.runId)?.abort();
-			liveChildren.get(item.runId)?.abort();
-		});
-		if (owned) void owned.terminate();
-		else if (pid && isProcessAlive(pid)) killPidTree(pid, updated.pidStartTime);
+		} else if (pid && isProcessAlive(pid)) {
+			const runId = updated.runId;
+			const killStartTime = startTime ?? updated.pidStartTime;
+			const kill = killPidTree(pid, killStartTime).catch((error: unknown) => {
+				const message = error instanceof Error ? error.message : String(error);
+				try {
+					withRecordLock(agentDir, runId, () => {
+						const latest = readRecords(agentDir).find((candidate) => candidate.runId === runId);
+						if (!latest) return;
+						saveRecord(agentDir, {
+							...latest,
+							error: latest.error ? `${latest.error}; ${message}` : message,
+						});
+					});
+				} catch {
+					// The cancelled status is already on disk.
+				}
+			});
+			trackExternalKill(kill);
+		}
 		return updated;
 	};
 	for (const child of descendantsOf(readRecords(agentDir), record.runId).reverse()) {
@@ -418,9 +642,10 @@ export async function terminateOwnedSubagents(runIds: readonly string[]): Promis
 		const owned = ownedChildren.get(runId);
 		if (owned) terminations.push(owned.terminate());
 	}
-	await Promise.all(terminations);
+	// One taskkill failure must not skip the other children: session_shutdown returns into process.exit.
+	await Promise.allSettled(terminations);
 	const runs = [...ids].map((runId) => childRuns.get(runId)).filter((run): run is Promise<void> => !!run);
-	await Promise.race([Promise.all(runs).then(() => {}), waitTimeout(TERMINATION_WAIT_MS)]);
+	await Promise.race([Promise.allSettled(runs).then(() => {}), waitTimeout(TERMINATION_WAIT_MS)]);
 }
 
 async function findSessionFile(cwd: string, sessionId: string): Promise<string | undefined> {
@@ -530,13 +755,56 @@ async function runSubagentProcess(
 ): Promise<void> {
 	let release: (() => void) | undefined;
 	let flushTimer: ReturnType<typeof setTimeout> | undefined;
+	let retryTimer: ReturnType<typeof setTimeout> | undefined;
+	let retryAttempt = 0;
+	let retryClosesRecord = false;
+	let registryWriteErrorLogged = false;
+	// One slot, but a close must replace a pending status write. The close
+	// marker is what stops a later save from putting the old pid back.
+	const scheduleRetry = (operation: () => void, closesRecord = false) => {
+		if (retryTimer) {
+			if (!closesRecord || retryClosesRecord) return;
+			clearTimeout(retryTimer);
+			retryTimer = undefined;
+		}
+		retryClosesRecord = closesRecord;
+		const delay = Math.min(200 * (retryAttempt + 1), 2_000);
+		retryAttempt += 1;
+		retryTimer = setTimeout(() => {
+			retryTimer = undefined;
+			retryClosesRecord = false;
+			operation();
+		}, delay);
+		retryTimer.unref?.();
+	};
+	const noteRegistryWriteError = (error: unknown) => {
+		if (registryWriteErrorLogged) return;
+		registryWriteErrorLogged = true;
+		const message = error instanceof Error ? error.message : String(error);
+		process.stderr.write(`pi-subagents: registry write failed for ${record.runId}: ${message}\n`);
+	};
 	const publish = () => {
-		Object.assign(record, saveRecord(context.agentDir, record));
-		context.onRecord?.(record);
+		try {
+			Object.assign(record, saveRecord(context.agentDir, record));
+			context.onRecord?.(record);
+			retryAttempt = 0;
+		} catch (error) {
+			// Timer and stdout callbacks are uncaughtException territory. A locked JSON must not exit Pi.
+			if (isTransientFsError(error)) scheduleRetry(publish);
+			else noteRegistryWriteError(error);
+		}
 	};
 	const publishClosed = () => {
-		Object.assign(record, clearRecordPid(context.agentDir, record));
-		context.onRecord?.(record);
+		try {
+			Object.assign(record, clearRecordPid(context.agentDir, record));
+			context.onRecord?.(record);
+			retryAttempt = 0;
+		} catch (error) {
+			record.pid = undefined;
+			record.pidStartTime = undefined;
+			if (isTransientFsError(error)) scheduleRetry(publishClosed, true);
+			else noteRegistryWriteError(error);
+		}
 	};
 	const diskCancelled = () => isRecordCancelled(context.agentDir, record.runId);
 	const schedulePublish = (immediate = false) => {
@@ -619,6 +887,8 @@ async function runSubagentProcess(
 		);
 
 		let child: ChildProcessWithoutNullStreams | undefined;
+		// where.exe can take seconds. Resolve it before the record lock so cancel can still get in.
+		const piLaunch = resolvePiLaunch();
 		withRecordLock(context.agentDir, record.runId, () => {
 			if (diskCancelled()) return;
 			// Re-resolve immediately before spawn so a swapped symlink cannot keep --approve.
@@ -627,7 +897,7 @@ async function runSubagentProcess(
 			if (context.projectTrusted && isWithinDirectory(record.cwd, trustedRoot)) {
 				args.push("--approve");
 			}
-			const invocation = getPiInvocation(args);
+			const invocation = { command: piLaunch.command, args: [...piLaunch.leadingArgs, ...args] };
 			child = spawn(invocation.command, invocation.args, {
 				cwd: record.cwd,
 				detached: process.platform !== "win32",
@@ -643,9 +913,11 @@ async function runSubagentProcess(
 					PI_SUBAGENT_DEPTH_FLAG_OVERRIDE: context.settings.maxDepthFlagOverride ? "1" : "0",
 				},
 			});
-			ownChild(record.runId, child);
+			ownChild(record.runId, child, () => record.pidStartTime);
 			record.pid = child.pid;
-			record.pidStartTime = child.pid ? readProcessIdentity(child.pid)?.startTime : undefined;
+			record.pidStartTime = process.platform === "win32" || !child.pid
+				? undefined
+				: readProcessIdentity(child.pid)?.startTime;
 			record.status = "starting";
 			record.activity = "starting";
 			publish();
@@ -670,11 +942,18 @@ async function runSubagentProcess(
 			lineParts = [];
 			lineLength = 0;
 			rejectPending(error);
+			// Persist before taskkill. A dead PID otherwise reconciles as "no longer running"
+			// and hides the transport error from the next registry read.
+			if (!closing && !isTerminalStatus(record.status)) settle("failed", error.message);
 			if (closing) return;
 			launchedChild.stdin.destroy();
 			const owned = ownedChildren.get(record.runId);
-			if (owned) void owned.terminate();
-			else if (record.pid && isProcessAlive(record.pid)) killPidTree(record.pid, record.pidStartTime);
+			if (owned) {
+				const termination = owned.terminate();
+				void termination.catch(() => {});
+			} else if (record.pid && isProcessAlive(record.pid)) {
+				void killPidTree(record.pid, record.pidStartTime).catch(() => {});
+			}
 		};
 		const writeLine = (value: Record<string, unknown>, id?: string) => {
 			if (launchedChild.stdin.destroyed || launchedChild.stdin.writableEnded) {
@@ -922,6 +1201,25 @@ async function runSubagentProcess(
 			stderr = `${stderr}\n${error.message}`.slice(-STDERR_LIMIT);
 			failTransport(error);
 		});
+		if (process.platform === "win32" && launchedChild.pid) {
+			const pid = launchedChild.pid;
+			const childExited = () => launchedChild.exitCode !== null || launchedChild.signalCode !== null;
+			// execFileSync stalls the event loop, so a pid can die and be reused without either liveness check noticing.
+			// The async probe watches for that and must not be stored once this child has exited.
+			if (childExited()) {
+				record.pid = undefined;
+				record.pidStartTime = undefined;
+			} else {
+				const startTime = await probeWindowsStartTime(pid);
+				if (childExited()) {
+					record.pid = undefined;
+					record.pidStartTime = undefined;
+				} else {
+					record.pidStartTime = startTime;
+				}
+			}
+			publish();
+		}
 
 		try {
 			const stateResponse = await send({ type: "get_state" }, { signal: runSignal, deadline: startupDeadline });
@@ -942,11 +1240,15 @@ async function runSubagentProcess(
 		} catch (error) {
 			launchedChild.stdin.end();
 			const owned = ownedChildren.get(record.runId);
-			if (owned) void owned.terminate();
+			if (owned) void owned.terminate().catch(() => {});
 			throw error;
 		}
 	} finally {
-		if (flushTimer) clearTimeout(flushTimer);
+		if (flushTimer) {
+			clearTimeout(flushTimer);
+			flushTimer = undefined;
+			publish();
+		}
 		release?.();
 	}
 }
