@@ -1,4 +1,4 @@
-import { statSync } from "node:fs";
+import { statSync, watch, type FSWatcher } from "node:fs";
 import { homedir } from "node:os";
 import type { Theme } from "@earendil-works/pi-coding-agent";
 import {
@@ -15,7 +15,7 @@ import {
 	visibleWidth,
 	wrapTextWithAnsi,
 } from "@earendil-works/pi-tui";
-import { descendantsOf, isTerminalStatus, markRecordResultState, readRecords } from "./registry.ts";
+import { descendantsOf, isTerminalStatus, markRecordResultState, readRecords, readRecordsAsync, registryDir } from "./registry.ts";
 import { buildTranscript, discoverSessionFile } from "./transcript.ts";
 import type { AgentRecord } from "./types.ts";
 
@@ -24,6 +24,8 @@ const MAX_TRANSCRIPT_LINES = 150;
 const SCROLL_STEP = 5;
 const SCROLL_PAGE = 20;
 const OVERLAY_MARGIN = 1;
+const REGISTRY_DEBOUNCE_MS = 30;
+const REGISTRY_POLL_MS = 1000;
 
 interface SubagentPanelOptions {
 	onMessage?: (record: AgentRecord, text: string) => Promise<void>;
@@ -95,6 +97,12 @@ export class SubagentPanel implements Component, Focusable {
 	private detailOverlay?: SubagentDetailOverlay;
 	private overlayHandle?: OverlayHandle;
 	private timer: ReturnType<typeof setInterval>;
+	private watcher?: FSWatcher;
+	private refreshTimer?: ReturnType<typeof setTimeout>;
+	private refreshing = false;
+	private refreshQueued = false;
+	private refreshVersion = 0;
+	private disposed = false;
 
 	get focused(): boolean {
 		return this._focused;
@@ -132,11 +140,11 @@ export class SubagentPanel implements Component, Focusable {
 			);
 		};
 		this.refresh();
+		this.watchRegistry();
 		this.timer = setInterval(() => {
-			const before = JSON.stringify(this.records);
-			this.refresh();
-			if (before !== JSON.stringify(this.records)) this.tui.requestRender();
-		}, 250);
+			this.watchRegistry();
+			void this.refreshAsync();
+		}, REGISTRY_POLL_MS);
 		this.timer.unref?.();
 	}
 
@@ -269,9 +277,68 @@ export class SubagentPanel implements Component, Focusable {
 		return this.renderDetail(width, this.detailMaxHeight());
 	}
 
+	private watchRegistry(): void {
+		if (this.watcher || this.disposed) return;
+		try {
+			const watcher = watch(registryDir(this.agentDir), () => this.scheduleRefresh());
+			this.watcher = watcher;
+			watcher.unref();
+			watcher.on("error", () => {
+				watcher.close();
+				if (this.watcher === watcher) this.watcher = undefined;
+			});
+		} catch {
+			// The registry may not exist yet. The fallback poll retries the watch.
+		}
+	}
+
+	private scheduleRefresh(): void {
+		if (this.disposed || this.refreshTimer) return;
+		this.refreshTimer = setTimeout(() => {
+			this.refreshTimer = undefined;
+			void this.refreshAsync();
+		}, REGISTRY_DEBOUNCE_MS);
+		this.refreshTimer.unref?.();
+	}
+
+	private async refreshAsync(): Promise<void> {
+		if (this.disposed) return;
+		if (this.refreshing) {
+			this.refreshQueued = true;
+			return;
+		}
+		this.refreshing = true;
+		const version = this.refreshVersion;
+		try {
+			const records = await readRecordsAsync(this.agentDir);
+			if (this.disposed) return;
+			// An explicit open/dismiss may have read a newer snapshot while I/O was pending.
+			if (version !== this.refreshVersion) {
+				this.refreshQueued = true;
+				return;
+			}
+			const before = JSON.stringify(this.records);
+			this.applyRecords(records);
+			if (before !== JSON.stringify(this.records)) this.tui.requestRender();
+		} catch {
+			// Keep the last good snapshot on transient storage errors; retry on the next wake.
+		} finally {
+			this.refreshing = false;
+			if (this.refreshQueued) {
+				this.refreshQueued = false;
+				this.scheduleRefresh();
+			}
+		}
+	}
+
 	private refresh(): void {
+		this.refreshVersion++;
+		this.applyRecords(readRecords(this.agentDir));
+	}
+
+	private applyRecords(records: AgentRecord[]): void {
 		const selectedId = this.rows()[this.selected]?.runId;
-		this.records = descendantsOf(readRecords(this.agentDir), this.currentRunId);
+		this.records = descendantsOf(records, this.currentRunId);
 		this.visible = this.records.filter((record) => !record.footerDismissed);
 		const rows = this.rows();
 		const restored = selectedId ? rows.findIndex((record) => record.runId === selectedId) : -1;
@@ -360,7 +427,6 @@ export class SubagentPanel implements Component, Focusable {
 	}
 
 	render(width: number): string[] {
-		this.refresh();
 		if (this.focused && this.detail && !this.overlayHandle) return this.renderDetail(width);
 		return this.renderTree(width);
 	}
@@ -527,6 +593,11 @@ export class SubagentPanel implements Component, Focusable {
 	}
 
 	dispose(): void {
+		this.disposed = true;
+		this.watcher?.close();
+		this.watcher = undefined;
+		if (this.refreshTimer) clearTimeout(this.refreshTimer);
+		this.refreshTimer = undefined;
 		this.detail = false;
 		this.messageInput.focused = false;
 		this.overlayHandle?.hide();

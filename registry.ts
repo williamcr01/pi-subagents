@@ -8,6 +8,7 @@ import {
 	statSync,
 	writeFileSync,
 } from "node:fs";
+import { readFile, readdir } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentRecord, AgentStatus } from "./types.ts";
 
@@ -68,9 +69,15 @@ function writeCancellationMarker(agentDir: string, record: AgentRecord): void {
 function readCancellationMarker(agentDir: string, runId: string): CancellationMarker | undefined {
 	const target = markerPath(agentDir, runId, "cancelled");
 	if (!existsSync(target)) return undefined;
+	let text = "";
+	try { text = readFileSync(target, "utf8"); } catch { /* The marker still counts. */ }
+	return parseCancellationMarker(text, runId);
+}
+
+function parseCancellationMarker(text: string, runId: string): CancellationMarker {
 	try {
-		const value = JSON.parse(readFileSync(target, "utf8")) as Partial<CancellationMarker>;
-		if (value.version === 1 && value.runId === runId && typeof value.cancelledAt === "string") {
+		const value = JSON.parse(text) as Partial<CancellationMarker> | null;
+		if (value?.version === 1 && value.runId === runId && typeof value.cancelledAt === "string") {
 			return value as CancellationMarker;
 		}
 	} catch {
@@ -79,7 +86,14 @@ function readCancellationMarker(agentDir: string, runId: string): CancellationMa
 	return { version: 1, runId, cancelledAt: new Date().toISOString(), error: "Cancelled" };
 }
 
-type ResultStateFlag = "resultsDelivered" | "resultsPreviewed" | "footerDismissed";
+const RESULT_STATE_FLAGS = ["resultsDelivered", "resultsPreviewed", "footerDismissed"] as const;
+type ResultStateFlag = typeof RESULT_STATE_FLAGS[number];
+
+interface RecordMarkers {
+	flags: readonly ResultStateFlag[];
+	cancellation?: CancellationMarker;
+	closed: boolean;
+}
 
 function resultStatePath(agentDir: string, record: AgentRecord, flag: ResultStateFlag): string {
 	return join(registryDir(agentDir), `${safeRunId(record.runId)}.${safeRunId(record.executionId ?? "legacy")}.${flag}`);
@@ -95,12 +109,17 @@ export function markRecordResultState(agentDir: string, record: AgentRecord, fla
 	atomicWrite(resultStatePath(agentDir, record, flag), "true\n");
 }
 
-function applyMarkers(agentDir: string, record: AgentRecord): AgentRecord {
+function readMarkers(agentDir: string, record: AgentRecord): RecordMarkers {
+	return {
+		flags: RESULT_STATE_FLAGS.filter((flag) => existsSync(resultStatePath(agentDir, record, flag))),
+		cancellation: readCancellationMarker(agentDir, record.runId),
+		closed: existsSync(markerPath(agentDir, record.runId, "closed")),
+	};
+}
+
+function applyMarkers(record: AgentRecord, { flags, cancellation, closed }: RecordMarkers): AgentRecord {
 	let result = record;
-	for (const flag of ["resultsDelivered", "resultsPreviewed", "footerDismissed"] as const) {
-		if (existsSync(resultStatePath(agentDir, record, flag))) result = { ...result, [flag]: true };
-	}
-	const cancellation = readCancellationMarker(agentDir, record.runId);
+	for (const flag of flags) result = { ...result, [flag]: true };
 	if (cancellation) {
 		result = {
 			...result,
@@ -115,9 +134,7 @@ function applyMarkers(agentDir: string, record: AgentRecord): AgentRecord {
 					: cancellation.cancelledAt,
 		};
 	}
-	if (existsSync(markerPath(agentDir, record.runId, "closed"))) {
-		result = { ...result, pid: undefined, pidStartTime: undefined };
-	}
+	if (closed) result = { ...result, pid: undefined, pidStartTime: undefined };
 	return result;
 }
 
@@ -131,7 +148,7 @@ export function saveRecord(agentDir: string, record: AgentRecord): AgentRecord {
 	const dir = registryDir(agentDir);
 	mkdirSync(dir, { recursive: true, mode: 0o700 });
 	if (record.status === "cancelled") writeCancellationMarker(agentDir, record);
-	const saved = applyMarkers(agentDir, record);
+	const saved = applyMarkers(record, readMarkers(agentDir, record));
 	atomicWrite(recordPath(agentDir, record.runId), `${JSON.stringify(saved)}\n`);
 	return saved;
 }
@@ -288,14 +305,9 @@ export function readRecords(agentDir: string): AgentRecord[] {
 		try {
 			const value: unknown = JSON.parse(readFileSync(join(dir, name), "utf8"));
 			if (!isRecord(value)) continue;
-			const marked = applyMarkers(agentDir, value);
+			const marked = applyMarkers(value, readMarkers(agentDir, value));
 			if (!TERMINAL.has(marked.status) && marked.pid && !isRecordedProcessAlive(marked)) {
-				records.push({
-					...marked,
-					status: "failed",
-					activity: "process exited unexpectedly",
-					error: marked.error ?? "Subagent process is no longer running",
-				});
+				records.push(exitedRecord(marked));
 			} else {
 				records.push(marked);
 			}
@@ -304,6 +316,74 @@ export function readRecords(agentDir: string): AgentRecord[] {
 		}
 	}
 	return records;
+}
+
+/** Nonblocking UI snapshot. Marker names come from one directory listing, not five stats per run. */
+export async function readRecordsAsync(agentDir: string): Promise<AgentRecord[]> {
+	const dir = registryDir(agentDir);
+	let names: string[];
+	try {
+		names = await readdir(dir);
+	} catch (error) {
+		if ((error as NodeJS.ErrnoException).code === "ENOENT") return [];
+		throw error;
+	}
+	const paths = new Set(names.map((name) => join(dir, name)));
+	const files = names.filter((name) => name.endsWith(".json"));
+	const records = new Array<AgentRecord | undefined>(files.length);
+	let next = 0;
+	const readNext = async () => {
+		while (next < files.length) {
+			const index = next++;
+			try {
+				const value: unknown = JSON.parse(await readFile(join(dir, files[index]!), "utf8"));
+				if (!isRecord(value)) continue;
+				let cancellation: CancellationMarker | undefined;
+				const cancelledPath = markerPath(agentDir, value.runId, "cancelled");
+				if (paths.has(cancelledPath)) {
+					let text = "";
+					try { text = await readFile(cancelledPath, "utf8"); } catch { /* The marker still counts. */ }
+					cancellation = parseCancellationMarker(text, value.runId);
+				}
+				const marked = applyMarkers(value, {
+					flags: RESULT_STATE_FLAGS.filter((flag) => paths.has(resultStatePath(agentDir, value, flag))),
+					cancellation,
+					closed: paths.has(markerPath(agentDir, value.runId, "closed")),
+				});
+				const alive = TERMINAL.has(marked.status) || !marked.pid || await isRecordedProcessAliveAsync(marked);
+				records[index] = alive ? marked : exitedRecord(marked);
+			} catch {
+				// Match readRecords: ignore malformed or concurrently removed records.
+			}
+		}
+	};
+	// Bound open files and parsing work, even with a large accumulated history.
+	await Promise.all(Array.from({ length: Math.min(8, files.length) }, readNext));
+	return records.filter((record): record is AgentRecord => record !== undefined);
+}
+
+async function isRecordedProcessAliveAsync(record: AgentRecord): Promise<boolean> {
+	// Read Linux /proc asynchronously; other platforms retain the existing nonblocking liveness check.
+	if (process.platform !== "linux" || !record.pidStartTime) return isRecordedProcessAlive(record);
+	if (!record.pid || !isProcessAlive(record.pid)) return false;
+	try {
+		const stat = await readFile(`/proc/${record.pid}/stat`, "utf8");
+		const close = stat.lastIndexOf(")");
+		if (close < 0) return true;
+		const startTime = stat.slice(close + 2).trim().split(/\s+/)[19];
+		return !startTime || startTime === record.pidStartTime;
+	} catch {
+		return true;
+	}
+}
+
+function exitedRecord(record: AgentRecord): AgentRecord {
+	return {
+		...record,
+		status: "failed",
+		activity: "process exited unexpectedly",
+		error: record.error ?? "Subagent process is no longer running",
+	};
 }
 
 export function descendantsOf(records: readonly AgentRecord[], parentRunId: string): AgentRecord[] {
